@@ -42,9 +42,6 @@ statuspage    →  опрашивает checker, копит историю в SQ
 локальной сборки и без клонирования репозитория. Рабочую папку `/opt/xray-checker-statuspage`
 и `data/` создаёт сам установщик; вручную создавать ничего не нужно.
 
-> Чтобы `docker compose pull` работал без авторизации, сделай GHCR-пакет публичным один раз:
-> GitHub → профиль → Packages → `xray-checker-statuspage` → Package settings → Change visibility → Public.
-
 ### Вариант A. Чистый сервер (установщик сам поставит nginx + HTTPS)
 
 ```bash
