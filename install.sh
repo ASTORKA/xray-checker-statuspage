@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/Mrvibecodic/xray-checker-statuspage"
+IMAGE="ghcr.io/mrvibecodic/xray-checker-statuspage:latest"
 INSTALL_DIR="/opt/xray-checker-statuspage"
 
 c_g(){ printf "\033[32m%s\033[0m\n" "$*"; }
@@ -44,26 +44,13 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 systemctl enable --now docker >/dev/null 2>&1 || true
 
-if [ -d "$INSTALL_DIR/.git" ]; then
-  c_g "Обновляю репозиторий в $INSTALL_DIR…"
-  git -C "$INSTALL_DIR" pull --ff-only || true
-elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
-  c_y "Папка $INSTALL_DIR уже существует — подключаю к репозиторию (твои docker-compose.yml/data не трогаю)…"
-  git -C "$INSTALL_DIR" init -q
-  git -C "$INSTALL_DIR" remote add origin "$REPO_URL" 2>/dev/null || git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
-  git -C "$INSTALL_DIR" fetch -q --depth 1 origin main && git -C "$INSTALL_DIR" checkout -q -f -B main origin/main || die "не удалось получить код в $INSTALL_DIR"
-else
-  c_g "Создаю $INSTALL_DIR и клонирую $REPO_URL…"
-  mkdir -p "$INSTALL_DIR"
-  git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" || die "git clone не удался"
-fi
+mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
-[ -f app.py ] || die "в репозитории нет app.py"
 
 if [ -f docker-compose.yml ]; then
   c_y "Найден существующий docker-compose.yml."
-  if ! ask_yn "Перенастроить заново? (нет = просто обновить и пересобрать)" n; then
-    docker compose up -d --build
+  if ! ask_yn "Перенастроить заново? (нет = обновить образ и перезапустить)" n; then
+    docker compose pull && docker compose up -d
     c_g "Обновлено. Текущая страница работает на прежних настройках."
     exit 0
   fi
@@ -98,15 +85,13 @@ if ask_yn "Поставить nginx и проксировать на домен?
     c_y "Домен не указан — пропускаю nginx. Сервис останется на http://127.0.0.1:${PORT}."
   else
     USE_NGINX=y
-    echo "Сертификат HTTPS:"
-    echo "  0) без сертификата (только HTTP)"
+    echo "Сертификат HTTPS (обязателен):"
     echo "  1) HTTP-01 — проверка по 80 порту (порт открыт извне)"
     echo "  2) Cloudflare DNS — без открытия порта (нужен доступ к Cloudflare)"
-    CERT_MODE="$(num "$(ask 'Выбор (0/1/2)' 1)" 1)"
-    if [ "$CERT_MODE" = 1 ] || [ "$CERT_MODE" = 2 ]; then
-      EMAIL="$(ask 'Email для Let'\''s Encrypt')"
-      [ -n "$EMAIL" ] || { c_y "Email не указан — без сертификата, nginx по HTTP."; CERT_MODE=0; }
-    fi
+    CERT_MODE="$(num "$(ask 'Выбор (1/2)' 1)" 1)"
+    [ "$CERT_MODE" = 2 ] || CERT_MODE=1
+    EMAIL="$(ask 'Email для Let'\''s Encrypt')"
+    while [ -z "$EMAIL" ]; do c_y "Email обязателен для сертификата."; EMAIL="$(ask 'Email для Let'\''s Encrypt')"; done
     if [ "$CERT_MODE" = 2 ]; then
       echo "Доступ к Cloudflare:"
       echo "  1) API Token (рекомендуется; права Zone.DNS: Edit)"
@@ -115,10 +100,10 @@ if ask_yn "Поставить nginx и проксировать на домен?
       if [ "$CF_AUTH" = 2 ]; then
         CF_EMAIL="$(ask 'Email аккаунта Cloudflare')"
         CF_KEY="$(asks 'Cloudflare Global API Key')"
-        { [ -n "$CF_EMAIL" ] && [ -n "$CF_KEY" ]; } || { c_y "Данные Cloudflare неполные — без сертификата, nginx по HTTP."; CERT_MODE=0; }
+        { [ -n "$CF_EMAIL" ] && [ -n "$CF_KEY" ]; } || die "Данные Cloudflare обязательны для DNS-проверки."
       else
         CF_TOKEN="$(asks 'Cloudflare API Token')"
-        [ -n "$CF_TOKEN" ] || { c_y "Токен пуст — без сертификата, nginx по HTTP."; CERT_MODE=0; }
+        [ -n "$CF_TOKEN" ] || die "Cloudflare API Token обязателен."
       fi
     fi
   fi
@@ -141,7 +126,7 @@ services:
       - "127.0.0.1:2112:2112"
 
   statuspage:
-    build: .
+    image: ${IMAGE}
     container_name: statuspage
     restart: unless-stopped
     depends_on:
@@ -161,8 +146,9 @@ services:
 EOF
 
 mkdir -p data
-c_g "Собираю и запускаю контейнеры…"
-docker compose up -d --build || die "не удалось поднять контейнеры. Частая причина — занят порт ${PORT} или 2112 (старый сервис?). Освободи порт (или укажи другой при повторном запуске) и попробуй снова. Логи: docker compose logs"
+c_g "Тяну образ и запускаю контейнеры…"
+docker compose pull || c_y "Не удалось стянуть образ statuspage. Если GHCR-пакет приватный — сделай его публичным (GitHub → Packages → этот пакет → Package settings → Change visibility → Public), либо выполни: docker login ghcr.io"
+docker compose up -d || die "не удалось поднять контейнеры. Частая причина — занят порт ${PORT} или 2112 (старый сервис?). Освободи порт (или укажи другой при повторном запуске) и попробуй снова. Логи: docker compose logs"
 
 sleep 6
 if curl -fsS "http://127.0.0.1:2112/api/v1/public/proxies" >/dev/null 2>&1; then
@@ -294,3 +280,4 @@ fi
 echo "Админка/метрики checker под Basic Auth: ${MUSER} / ${MPASS}"
 echo "Доступы сохранены в ${INSTALL_DIR}/.install-info"
 echo "Фавикон/лого: положи файл favicon.png в ${INSTALL_DIR}/data — подхватится сам."
+                                                                                                                                      

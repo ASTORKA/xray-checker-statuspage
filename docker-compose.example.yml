@@ -14,7 +14,7 @@ services:
       - "127.0.0.1:2112:2112"
 
   statuspage:
-    build: .
+    image: ghcr.io/mrvibecodic/xray-checker-statuspage:latest
     container_name: statuspage
     restart: unless-stopped
     depends_on:
