@@ -47,8 +47,14 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 if [ -d "$INSTALL_DIR/.git" ]; then
   c_g "Обновляю репозиторий в $INSTALL_DIR…"
   git -C "$INSTALL_DIR" pull --ff-only || true
+elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+  c_y "Папка $INSTALL_DIR уже существует — подключаю к репозиторию (твои docker-compose.yml/data не трогаю)…"
+  git -C "$INSTALL_DIR" init -q
+  git -C "$INSTALL_DIR" remote add origin "$REPO_URL" 2>/dev/null || git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
+  git -C "$INSTALL_DIR" fetch -q --depth 1 origin main && git -C "$INSTALL_DIR" checkout -q -f -B main origin/main || die "не удалось получить код в $INSTALL_DIR"
 else
-  c_g "Клонирую $REPO_URL → $INSTALL_DIR…"
+  c_g "Создаю $INSTALL_DIR и клонирую $REPO_URL…"
+  mkdir -p "$INSTALL_DIR"
   git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" || die "git clone не удался"
 fi
 cd "$INSTALL_DIR"
@@ -274,17 +280,4 @@ fi
 cat > .install-info <<EOF
 Логин/пароль админки checker: ${MUSER} / ${MPASS}
 Страница: ${PUB_URL}
-Локально: http://127.0.0.1:${PORT}
-EOF
-
-echo
-c_g "================ Готово ================"
-if [ "$USE_NGINX" = y ]; then
-  c_g "Открой: ${PUB_URL}"
-else
-  c_g "Страница слушает: http://127.0.0.1:${PORT}"
-  c_y "Направь на неё свою панель/прокси (proxy_pass http://127.0.0.1:${PORT})."
-fi
-echo "Админка/метрики checker под Basic Auth: ${MUSER} / ${MPASS}"
-echo "Доступы сохранены в ${INSTALL_DIR}/.install-info"
-echo "Фавикон/лого: положи файл favicon.png в ${INSTALL_DIR}/data — подхватится сам."
+Лока
