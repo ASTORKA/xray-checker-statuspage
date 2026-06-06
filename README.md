@@ -1,7 +1,12 @@
-# xray-checker-statuspage
+# Кастомный статус-пейдж для xray-checker
 
-Современная кастомная страница статуса VPN/прокси-серверов поверх
+`xray-checker-statuspage` — современная страница статуса VPN/прокси-серверов поверх
 [xray-checker](https://github.com/kutovoys/xray-checker).
+
+> **Спасибо [kutovoys](https://github.com/kutovoys)** — автору
+> [xray-checker](https://github.com/kutovoys/xray-checker): отличный инструмент, который делает
+> всю реальную работу по проверке прокси. Этот проект лишь рисует поверх него страницу статуса
+> и использует **официальный образ** `kutovoys/xray-checker`.
 
 Строка на каждый сервер, шкала аптайма за 30 дней с флагами стран; наведение на день —
 дата, аптайм и длительность простоя. Клик по любому дню раскрывает детализацию: график пинга
@@ -190,6 +195,10 @@ cd /opt/xray-checker-statuspage && docker compose pull && docker compose up -d
 
 `noindex, nofollow`, маскировка заголовка `Server`, рандомизация CSS-классов при каждом старте —
 сложнее найти инстансы по шаблонным «тегам».
+
+## Благодарности
+
+- [kutovoys/xray-checker](https://github.com/kutovoys/xray-checker) — движок проверки прокси, на котором всё держится.
 
 ## Лицензия
 
