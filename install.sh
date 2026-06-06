@@ -280,4 +280,17 @@ fi
 cat > .install-info <<EOF
 Логин/пароль админки checker: ${MUSER} / ${MPASS}
 Страница: ${PUB_URL}
-Лока
+Локально: http://127.0.0.1:${PORT}
+EOF
+
+echo
+c_g "================ Готово ================"
+if [ "$USE_NGINX" = y ]; then
+  c_g "Открой: ${PUB_URL}"
+else
+  c_g "Страница слушает: http://127.0.0.1:${PORT}"
+  c_y "Направь на неё свою панель/прокси (proxy_pass http://127.0.0.1:${PORT})."
+fi
+echo "Админка/метрики checker под Basic Auth: ${MUSER} / ${MPASS}"
+echo "Доступы сохранены в ${INSTALL_DIR}/.install-info"
+echo "Фавикон/лого: положи файл favicon.png в ${INSTALL_DIR}/data — подхватится сам."
