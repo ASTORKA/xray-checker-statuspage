@@ -1,0 +1,7 @@
+docker-compose.yml
+.install-info
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/

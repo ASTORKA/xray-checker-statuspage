@@ -1,0 +1,33 @@
+services:
+  xray-checker:
+    image: kutovoys/xray-checker
+    container_name: xray-checker
+    restart: unless-stopped
+    environment:
+      - SUBSCRIPTION_URL=https://example.com/sub
+      - METRICS_PROTECTED=true
+      - METRICS_USERNAME=admin
+      - METRICS_PASSWORD=CHANGE_ME
+      - WEB_PUBLIC=true
+      - PROXY_CHECK_INTERVAL=300
+    ports:
+      - "127.0.0.1:2112:2112"
+
+  statuspage:
+    build: .
+    container_name: statuspage
+    restart: unless-stopped
+    depends_on:
+      - xray-checker
+    environment:
+      - CHECKER_URL=http://xray-checker:2112
+      - POLL_INTERVAL=300
+      - DAYS=30
+      - TZ=Europe/Moscow
+      - TITLE=Статус серверов
+      - SUBTITLE=Доступность серверов в реальном времени
+      - DB_PATH=/data/status.db
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
