@@ -94,7 +94,9 @@ COUNTRY_KEYWORDS = [
     ("sweden", "se"), ("швец", "se"), ("stockholm", "se"),
     ("switzerland", "ch"), ("швейцар", "ch"), ("zurich", "ch"),
     ("canada", "ca"), ("канад", "ca"), ("toronto", "ca"),
-    ("italy", "it"), ("итал", "it"), ("milan", "it"), ("rome", "it"),
+    ("italy", "it"), ("italia", "it"), ("итал", "it"), ("milan", "it"), ("milano", "it"),
+    ("rome", "it"), ("roma", "it"), ("naples", "it"), ("napoli", "it"), ("неапол", "it"),
+    ("turin", "it"), ("torino", "it"), ("турин", "it"), ("venice", "it"), ("venezia", "it"), ("венеци", "it"),
     ("spain", "es"), ("испан", "es"), ("madrid", "es"),
     ("hong kong", "hk"), ("гонконг", "hk"),
     ("korea", "kr"), ("корея", "kr"), ("seoul", "kr"),
@@ -434,7 +436,7 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .item:hover{border-color:rgba(127,140,158,.42);box-shadow:0 2px 10px rgba(18,28,45,.07);}
 .row{display:flex;align-items:center;gap:14px;padding:12px 15px;cursor:pointer;transition:background .14s;}
 .row:hover{background:var(--hover);}
-.label{width:184px;flex:none;display:flex;align-items:center;gap:9px;min-width:0;}
+.label{width:230px;flex:none;display:flex;align-items:center;gap:9px;min-width:0;}
 .flag{width:23px;height:16px;border-radius:3px;object-fit:cover;border:1px solid rgba(0,0,0,.12);flex:none;
   background:var(--soft);}
 .nm{min-width:0;}
