@@ -436,7 +436,7 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .item:hover{border-color:rgba(127,140,158,.42);box-shadow:0 2px 10px rgba(18,28,45,.07);}
 .row{display:flex;align-items:center;gap:14px;padding:12px 15px;cursor:pointer;transition:background .14s;}
 .row:hover{background:var(--hover);}
-.label{width:230px;flex:none;display:flex;align-items:center;gap:9px;min-width:0;}
+.label{width:214px;flex:none;display:flex;align-items:center;gap:9px;min-width:0;}
 .flag{width:23px;height:16px;border-radius:3px;object-fit:cover;border:1px solid rgba(0,0,0,.12);flex:none;
   background:var(--soft);}
 .nm{min-width:0;}
