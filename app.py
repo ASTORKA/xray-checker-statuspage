@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import re
@@ -24,6 +25,8 @@ TITLE = os.environ.get("TITLE", "Статус серверов")
 SUBTITLE = os.environ.get("SUBTITLE", "Доступность серверов в реальном времени")
 TZ_NAME = os.environ.get("TZ", "Europe/Moscow")
 SERVER_HEADER = os.environ.get("SERVER_HEADER", "nginx")
+STATIC_CACHE = "public, max-age=31536000, immutable"
+NO_CACHE = "no-cache, no-store, must-revalidate"
 
 RU_MONTHS = ["", "янв", "фев", "мар", "апр", "май", "июн",
              "июл", "авг", "сен", "окт", "ноя", "дек"]
@@ -552,7 +555,9 @@ function fmtTime(ts,ds){
 }
 function escapeHtml(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML;}
 var tip=document.getElementById("tip");
+function evXY(e){var t=e.touches&&e.touches[0];return t||e;}
 function moveTip(e){
+  e=evXY(e);
   var w=tip.offsetWidth,x=e.clientX+14,y=e.clientY-10;
   if(x+w>window.innerWidth-8)x=e.clientX-w-14;
   tip.style.left=x+"px";tip.style.top=Math.max(8,y)+"px";
@@ -642,9 +647,9 @@ function renderToday(panel,data){
     }else{sc.scrollLeft=0;}
   }
   var svgEl=panel.querySelector("svg"),cursor=svgEl.querySelector(".cursor"),samples=data.samples;
-  svgEl.addEventListener("mousemove",function(e){
+  function scrub(cx,ev){
     var r=svgEl.getBoundingClientRect();
-    var frac=(e.clientX-r.left)/r.width;if(frac<0)frac=0;if(frac>1)frac=1;
+    var frac=(cx-r.left)/r.width;if(frac<0)frac=0;if(frac>1)frac=1;
     var ts=ds+frac*span,best=null,bd=1e15;
     for(var i=0;i<samples.length;i++){var dd=Math.abs(samples[i].ts-ts);if(dd<bd){bd=dd;best=samples[i];}}
     if(!best)return;
@@ -653,9 +658,14 @@ function renderToday(panel,data){
     tip.innerHTML='<div class="d">'+fmtTime(best.ts,ds)+'</div>'+
       (best.online?'<div class="k">опрос: <b style="color:var(--ok)">успешно</b></div><div class="k">пинг: <b>'+best.latency+' мс</b></div>'
                   :'<div class="k"><b style="color:var(--bad)">ошибка опроса</b></div>');
-    tip.style.opacity="1";moveTip(e);
-  });
+    tip.style.opacity="1";moveTip(ev);
+  }
+  svgEl.addEventListener("mousemove",function(e){scrub(e.clientX,e);});
   svgEl.addEventListener("mouseleave",function(){cursor.setAttribute("opacity","0");hideTip();});
+  var td=null;
+  svgEl.addEventListener("touchstart",function(e){var t=e.touches[0];if(!t)return;td={x:t.clientX,y:t.clientY,m:false};scrub(t.clientX,t);},{passive:true});
+  svgEl.addEventListener("touchmove",function(e){if(!td)return;var t=e.touches[0];if(!t)return;if(!td.m&&(Math.abs(t.clientX-td.x)>8||Math.abs(t.clientY-td.y)>8)){td.m=true;cursor.setAttribute("opacity","0");hideTip();}},{passive:true});
+  svgEl.addEventListener("touchend",function(){td=null;},{passive:true});
   panelH(panel);
 }
 var built=false,order=[],nodes={};
@@ -687,6 +697,17 @@ function openPanel(panel,sid){
     .then(function(r){return r.json();})
     .then(function(td){renderToday(panel,td);})
     .catch(function(){panel.innerHTML='<div class="empty">Не удалось загрузить.</div>';panelH(panel);});
+}
+function refreshPanel(panel,sid){
+  var sc=panel.querySelector(".tscroll");
+  var keep=sc?sc.scrollLeft:null;
+  fetch("api/today?sid="+encodeURIComponent(sid))
+    .then(function(r){return r.json();})
+    .then(function(td){
+      renderToday(panel,td);
+      if(keep!==null){var s2=panel.querySelector(".tscroll");if(s2)s2.scrollLeft=keep;}
+    })
+    .catch(function(){});
 }
 function loadDay(panel,sid,date){
   hideTip();
@@ -767,7 +788,7 @@ function render(data){
   var fresh=data.lastCheck!==lastSeen;lastSeen=data.lastCheck;
   if(sameOrder(data)){
     data.servers.forEach(function(s){var item=nodes[s.sid];if(item)applyServer(item,s,data.days);});
-    if(fresh)for(var sid in nodes){var it=nodes[sid];if(it.classList.contains("open")&&(it._day===null||it._day===undefined))openPanel(it._panel,it._sid);}
+    if(fresh)for(var sid in nodes){var it=nodes[sid];if(it.classList.contains("open")&&(it._day===null||it._day===undefined))refreshPanel(it._panel,it._sid);}
   }else{
     buildList(data);
   }
@@ -790,7 +811,9 @@ window.addEventListener("resize",function(){
   var ps=document.querySelectorAll(".item.open .panel");
   for(var i=0;i<ps.length;i++)ps[i].style.maxHeight=ps[i].scrollHeight+"px";
 });
-load();setInterval(load,60000);
+load();
+setInterval(function(){if(!document.hidden)load();},60000);
+document.addEventListener("visibilitychange",function(){if(!document.hidden)load();});
 </script>
 </body>
 </html>"""
@@ -836,13 +859,23 @@ class Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return SERVER_HEADER
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, cache=NO_CACHE):
         data = body.encode("utf-8") if isinstance(body, str) else body
+        gz = False
+        ae = self.headers.get("Accept-Encoding", "")
+        compressible = ("text/" in ctype or "json" in ctype
+                        or "javascript" in ctype or "svg" in ctype)
+        if compressible and "gzip" in ae and len(data) >= 256:
+            data = gzip.compress(data, 6)
+            gz = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Robots-Tag", "noindex, nofollow")
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Cache-Control", cache)
+        if gz:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         self.wfile.write(data)
 
@@ -874,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with open(img, "rb") as f:
                     blob = f.read()
-                self._send(200, blob, IMG_EXT.get(ext, "application/octet-stream"))
+                self._send(200, blob, IMG_EXT.get(ext, "application/octet-stream"), STATIC_CACHE)
             except Exception:
                 self._send(404, "Not Found", "text/plain; charset=utf-8")
         elif path.startswith("/fonts/"):
@@ -883,7 +916,7 @@ class Handler(BaseHTTPRequestHandler):
             if fn.endswith(".woff2") and os.path.isfile(fp):
                 with open(fp, "rb") as f:
                     blob = f.read()
-                self._send(200, blob, "font/woff2")
+                self._send(200, blob, "font/woff2", STATIC_CACHE)
             else:
                 self._send(404, "Not Found", "text/plain; charset=utf-8")
         elif path == "/health":
