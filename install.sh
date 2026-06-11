@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="ghcr.io/mrvibecodic/xray-checker-statuspage:latest"
+REPO_URL="https://github.com/ASTORKA/xray-checker-statuspage.git"
+REPO_BRANCH="main"
+SRC_DIR_REL="src"
 INSTALL_DIR="/opt/xray-checker-statuspage"
 
 c_g(){ printf "\033[32m%s\033[0m\n" "$*"; }
@@ -63,6 +65,29 @@ write_admin_token_info(){
   fi
 }
 
+ensure_source(){
+  if [ -d "${SRC_DIR_REL}/.git" ]; then
+    c_g "Обновляю исходники в ./${SRC_DIR_REL}…"
+    git -C "${SRC_DIR_REL}" remote set-url origin "${REPO_URL}" >/dev/null 2>&1 || true
+    git -C "${SRC_DIR_REL}" fetch --depth 1 origin "${REPO_BRANCH}" >/dev/null 2>&1 || \
+      die "не удалось обновить ./${SRC_DIR_REL} из ${REPO_URL}"
+    git -C "${SRC_DIR_REL}" reset --hard "origin/${REPO_BRANCH}" >/dev/null 2>&1 || \
+      die "не удалось переключить ./${SRC_DIR_REL} на ${REPO_BRANCH}"
+  else
+    c_g "Клонирую исходники из ${REPO_URL} в ./${SRC_DIR_REL}…"
+    rm -rf "${SRC_DIR_REL}"
+    git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${SRC_DIR_REL}" >/dev/null 2>&1 || \
+      die "не удалось клонировать ${REPO_URL}"
+  fi
+}
+
+# Заменяет в compose `image: ghcr.io/...xray-checker-statuspage...` на `build: ./src`.
+migrate_image_to_build(){
+  local file="$1"
+  grep -qE '^[[:space:]]*image:[[:space:]]*ghcr\.io/[^[:space:]]*xray-checker-statuspage' "$file" || return 1
+  sed -i -E 's|^([[:space:]]*)image:[[:space:]]*ghcr\.io/[^[:space:]]*xray-checker-statuspage[^[:space:]]*$|\1build: ./'"${SRC_DIR_REL}"'|' "$file"
+}
+
 [ "$(id -u)" -eq 0 ] || die "запусти от root:  sudo bash install.sh"
 
 c_g "== xray-checker-statuspage =="
@@ -106,7 +131,11 @@ if [ -f docker-compose.yml ]; then
         fi
       fi
     fi
-    docker compose pull && docker compose up -d
+    ensure_source
+    if migrate_image_to_build docker-compose.yml; then
+      c_g "docker-compose.yml переключён с готового образа на локальную сборку из ./${SRC_DIR_REL}."
+    fi
+    docker compose up -d --build || die "не удалось пересобрать/запустить контейнеры. Логи: docker compose logs"
     c_g "Обновлено. Текущая страница работает на прежних настройках."
     exit 0
   fi
@@ -190,7 +219,7 @@ services:
       - "127.0.0.1:2112:2112"
 
   statuspage:
-    image: ${IMAGE}
+    build: ./${SRC_DIR_REL}
     container_name: statuspage
     restart: unless-stopped
     depends_on:
@@ -211,9 +240,9 @@ services:
 EOF
 
 mkdir -p data
-c_g "Тяну образ и запускаю контейнеры…"
-docker compose pull || c_y "Не удалось стянуть образ statuspage. Если GHCR-пакет приватный — сделай его публичным (GitHub → Packages → этот пакет → Package settings → Change visibility → Public), либо выполни: docker login ghcr.io"
-docker compose up -d || die "не удалось поднять контейнеры. Частая причина — занят порт ${PORT} или 2112 (старый сервис?). Освободи порт (или укажи другой при повторном запуске) и попробуй снова. Логи: docker compose logs"
+ensure_source
+c_g "Собираю образ statuspage из исходников и запускаю контейнеры…"
+docker compose up -d --build || die "не удалось собрать/поднять контейнеры. Частая причина — занят порт ${PORT} или 2112 (старый сервис?). Освободи порт (или укажи другой при повторном запуске) и попробуй снова. Логи: docker compose logs"
 
 sleep 6
 if curl -fsS "http://127.0.0.1:2112/api/v1/public/proxies" >/dev/null 2>&1; then

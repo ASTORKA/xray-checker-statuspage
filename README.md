@@ -37,10 +37,10 @@ statuspage    →  опрашивает checker, копит историю в SQ
 
 Нужны Ubuntu/Debian и root. Установщик сам поставит Docker при необходимости.
 
-Образ собирается автоматически в GitHub Actions и публикуется в GHCR
-(`ghcr.io/mrvibecodic/xray-checker-statuspage`), а сервер только **тянет готовый образ** — без
-локальной сборки и без клонирования репозитория. Рабочую папку `/opt/xray-checker-statuspage`
-и `data/` создаёт сам установщик; вручную создавать ничего не нужно.
+Установщик клонирует исходники этого форка в `/opt/xray-checker-statuspage/src` и собирает
+Docker-образ локально (`docker compose up -d --build`). Рабочую папку, `data/` и `src/`
+создаёт сам установщик; вручную создавать ничего не нужно. Образ собирается быстро —
+`python:3.12-slim` + один `app.py`.
 
 > **Важно: отключите HWID у сервисного пользователя.** Учётка, чью ссылку подписки вы укажете
 > в `SUBSCRIPTION_URL`, должна быть **без ограничения HWID** (лимита устройств). xray-checker
@@ -52,7 +52,7 @@ statuspage    →  опрашивает checker, копит историю в SQ
 ### Вариант A. Чистый сервер (установщик сам поставит nginx + HTTPS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
@@ -67,7 +67,7 @@ sudo bash install.sh
 На вопрос про nginx отвечаешь «нет» — сервис поднимется на `http://127.0.0.1:8080`, проксирует панель/твой nginx.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
@@ -98,15 +98,18 @@ sudo bash install.sh
 
 ```bash
 mkdir -p /opt/xray-checker-statuspage && cd /opt/xray-checker-statuspage
-curl -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/docker-compose.example.yml -o docker-compose.yml
-nano docker-compose.yml
-docker compose pull && docker compose up -d
+git clone --depth 1 https://github.com/ASTORKA/xray-checker-statuspage.git src
+curl -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/docker-compose.example.yml -o docker-compose.yml
+# заменить `image: ghcr.io/...` на `build: ./src` в секции statuspage
+sed -i -E 's|^(\s*)image:\s*ghcr\.io/[^[:space:]]*xray-checker-statuspage[^[:space:]]*$|\1build: ./src|' docker-compose.yml
+nano docker-compose.yml   # задать SUBSCRIPTION_URL, ADMIN_TOKEN и т.п.
+docker compose up -d --build
 ```
 
 ## Обновление
 
 ```bash
-cd /opt/xray-checker-statuspage && docker compose pull && docker compose up -d
+cd /opt/xray-checker-statuspage && git -C src pull && docker compose up -d --build
 ```
 
 Либо повторно `sudo bash install.sh` → «не перенастраивать»: обновит образ и перезапустит, настройки сохранятся.
