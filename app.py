@@ -222,6 +222,12 @@ def autoclean_default():
     return "1" if STALE_AFTER_HOURS > 0 else "0"
 
 
+def skip_global_default():
+    # Отсев включён, если порог достижим (<= 1.0). При GLOBAL_OUTAGE_RATIO > 1
+    # фича отключена через env и тогл в UI недоступен.
+    return "1" if GLOBAL_OUTAGE_RATIO <= 1.0 else "0"
+
+
 def delete_server(sid):
     """Удаляет всю группу записей с тем же `name`, что и у переданного `sid`.
 
@@ -260,15 +266,21 @@ def poll_once():
     now = int(time.time())
     today = datetime.now(tz()).strftime("%Y-%m-%d")
 
-    # Отсев глобального сбоя чекера: считаем валидные прокси и долю офлайн в этом цикле.
+    # Отсев глобального сбоя чекера: если в одном опросе доля офлайн-прокси >= порога
+    # (по умолчанию — когда офлайн ВСЕ), цикл считается артефактом самого xray-checker
+    # и не пишется в историю. Управляется двумя уровнями:
+    #   - env GLOBAL_OUTAGE_RATIO (порог; > 1 — мастер-выключатель),
+    #   - settings `skip_global` (переключатель в UI админ-режима).
     valid = [p for p in proxies if (p.get("stableId") or "")]
     n_valid = len(valid)
     n_offline = sum(1 for p in valid if not p.get("online"))
     if n_valid >= 2 and (n_offline / n_valid) >= GLOBAL_OUTAGE_RATIO:
-        print("global-outage: %d/%d прокси офлайн в одном опросе — цикл пропущен "
-              "(артефакт чекера, не записываем в историю)" % (n_offline, n_valid),
-              flush=True)
-        return
+        sg_on = get_setting("skip_global", skip_global_default()) == "1"
+        if sg_on:
+            print("global-outage: %d/%d прокси офлайн в одном опросе — цикл пропущен "
+                  "(артефакт чекера, не записываем в историю)" % (n_offline, n_valid),
+                  flush=True)
+            return
 
     with _lock, conn() as c:
         for seq, p in enumerate(proxies):
@@ -686,10 +698,12 @@ body{margin:0;background:var(--bg);color:var(--tx);
   margin-left:2px;transition:background .15s,color .15s,border-color .15s;}
 .delbtn:hover{background:rgba(232,80,80,.12);color:var(--bad);border-color:var(--bad);}
 #lock.lockon{background:rgba(47,107,255,.13);color:var(--info);border-color:var(--info);}
-.adminbar{display:flex;align-items:center;gap:16px;
+.adminbar{display:flex;flex-direction:column;
   background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:12px 16px;margin-bottom:18px;box-shadow:var(--shadow);
+  padding:4px 16px;margin-bottom:18px;box-shadow:var(--shadow);
   animation:fadeUp .34s ease both;}
+.adminrow{display:flex;align-items:center;gap:16px;padding:12px 0;}
+.adminrow + .adminrow{border-top:1px solid var(--line);}
 .adminlabel{flex:1;font-size:14px;color:var(--tx);min-width:0;}
 .adminlabel small{display:block;font-size:12.5px;color:var(--tx3);margin-top:2px;font-weight:400;}
 .adminlabel.aclocked small{color:var(--bad);}
@@ -739,11 +753,20 @@ body{margin:0;background:var(--bg);color:var(--tx);
     <div class="stat"><div class="l">Средний пинг</div><div class="v" id="s-ping">—</div></div>
   </div>
   <div id="adminbar" class="adminbar" hidden>
-    <div id="adminlabel" class="adminlabel">
-      Авто-удаление устаревших записей
-      <small id="ac-sub">через <b id="ac-hours">—</b> ч после исчезновения из чекера</small>
+    <div class="adminrow">
+      <div id="adminlabel" class="adminlabel">
+        Авто-удаление устаревших записей
+        <small id="ac-sub">через <b id="ac-hours">—</b> ч после исчезновения из чекера</small>
+      </div>
+      <button id="ac-toggle" class="actoggle" type="button" aria-label="Авто-удаление"></button>
     </div>
-    <button id="ac-toggle" class="actoggle" type="button" aria-label="Авто-удаление"></button>
+    <div class="adminrow">
+      <div id="sg-label" class="adminlabel">
+        Игнорировать глобальные сбои чекера
+        <small id="sg-sub">когда офлайн все серверы сразу — не считать это простоем</small>
+      </div>
+      <button id="sg-toggle" class="actoggle" type="button" aria-label="Игнорировать глобальные сбои"></button>
+    </div>
   </div>
   <div id="list"><div class="skel">Загрузка данных…</div></div>
   <div class="legend">
@@ -1079,8 +1102,9 @@ function logoutAdmin(){
   built=false;load();
 }
 var autocleanState=null, autocleanLocked=false;
-function applyAutocleanUI(state){
-  var t=document.getElementById("ac-toggle");if(!t)return;
+var skipGlobalState=null, skipGlobalLocked=false;
+function applyToggleUI(id,state){
+  var t=document.getElementById(id);if(!t)return;
   if(state){t.classList.add("actogon");}else{t.classList.remove("actogon");}
   t.setAttribute("aria-checked",state?"true":"false");
 }
@@ -1090,39 +1114,67 @@ function loadAdminSettings(){
   fetch("api/admin/settings",{headers:{"X-Admin-Token":adminToken}})
     .then(function(r){if(!r.ok){if(r.status===401)logoutAdmin();throw 0;}return r.json();})
     .then(function(s){
+      // Авто-удаление устаревших записей
       autocleanState=!!s.autoclean;
       autocleanLocked=!!s.autocleanLocked;
-      document.getElementById("ac-hours").textContent=s.staleHours||"—";
       var sub=document.getElementById("ac-sub");
       var lbl=document.getElementById("adminlabel");
       if(autocleanLocked){
         sub.innerHTML='выключено через переменную <code>STALE_AFTER_HOURS=0</code>';
         lbl.classList.add("aclocked");
       }else{
-        sub.innerHTML='через <b id="ac-hours">'+s.staleHours+'</b> ч после исчезновения из чекера';
+        sub.innerHTML='через <b>'+s.staleHours+'</b> ч после исчезновения из чекера';
         lbl.classList.remove("aclocked");
       }
-      var t=document.getElementById("ac-toggle");
-      t.disabled=autocleanLocked;
-      applyAutocleanUI(autocleanState);
+      document.getElementById("ac-toggle").disabled=autocleanLocked;
+      applyToggleUI("ac-toggle",autocleanState);
+      // Игнорировать глобальные сбои чекера
+      skipGlobalState=!!s.skipGlobal;
+      skipGlobalLocked=!!s.skipGlobalLocked;
+      var sgsub=document.getElementById("sg-sub");
+      var sglbl=document.getElementById("sg-label");
+      if(skipGlobalLocked){
+        sgsub.innerHTML='выключено через переменную <code>GLOBAL_OUTAGE_RATIO&gt;1</code>';
+        sglbl.classList.add("aclocked");
+      }else{
+        var pct=Math.round((s.globalRatio||1)*100);
+        sgsub.innerHTML='когда офлайн ≥ '+pct+'% серверов сразу — не считать это простоем';
+        sglbl.classList.remove("aclocked");
+      }
+      document.getElementById("sg-toggle").disabled=skipGlobalLocked;
+      applyToggleUI("sg-toggle",skipGlobalState);
       ab.hidden=false;
     })
     .catch(function(){});
 }
-function toggleAutoclean(){
-  if(!adminMode||autocleanLocked)return;
-  var newState=!autocleanState;
-  applyAutocleanUI(newState);
+function postSetting(key,toggleId,getState,setState,getLocked){
+  if(!adminMode||getLocked())return;
+  var newState=!getState();
+  applyToggleUI(toggleId,newState);
+  var body={};body[key]=newState;
   fetch("api/admin/settings",{method:"POST",
     headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
-    body:JSON.stringify({autoclean:newState})})
+    body:JSON.stringify(body)})
     .then(function(r){
-      if(r.ok){autocleanState=newState;}
-      else{applyAutocleanUI(autocleanState);if(r.status===401)logoutAdmin();}
+      if(r.ok){setState(newState);}
+      else{applyToggleUI(toggleId,getState());if(r.status===401)logoutAdmin();}
     })
-    .catch(function(){applyAutocleanUI(autocleanState);});
+    .catch(function(){applyToggleUI(toggleId,getState());});
 }
-(function(){var t=document.getElementById("ac-toggle");if(t)t.addEventListener("click",toggleAutoclean);})();
+(function(){
+  var ac=document.getElementById("ac-toggle");
+  if(ac)ac.addEventListener("click",function(){
+    postSetting("autoclean","ac-toggle",
+      function(){return autocleanState;},function(v){autocleanState=v;},
+      function(){return autocleanLocked;});
+  });
+  var sg=document.getElementById("sg-toggle");
+  if(sg)sg.addEventListener("click",function(){
+    postSetting("skipGlobal","sg-toggle",
+      function(){return skipGlobalState;},function(v){skipGlobalState=v;},
+      function(){return skipGlobalLocked;});
+  });
+})();
 function deleteServer(sid,name,members){
   var n=members||1;
   var extra=n>1?'\n\nЭто группа из '+n+' sub-серверов одного хоста (роутинг xray-checker) — будут удалены все.':'';
@@ -1176,7 +1228,7 @@ _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "tyaxis", "tstats", "taxis", "phead", "sdot",
                 "overall", "pgrad",
                 "delbtn", "lockon", "lock",
-                "adminbar", "adminlabel", "actoggle", "actogon", "aclocked"]
+                "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
@@ -1308,10 +1360,14 @@ class Handler(BaseHTTPRequestHandler):
                            "application/json; charset=utf-8")
                 return
             ac = get_setting("autoclean", autoclean_default()) == "1"
+            sg = get_setting("skip_global", skip_global_default()) == "1"
             self._send(200, json.dumps({
                 "autoclean": ac,
                 "staleHours": STALE_AFTER_HOURS,
                 "autocleanLocked": STALE_AFTER_HOURS <= 0,
+                "skipGlobal": sg,
+                "globalRatio": GLOBAL_OUTAGE_RATIO,
+                "skipGlobalLocked": GLOBAL_OUTAGE_RATIO > 1.0,
             }, ensure_ascii=False), "application/json; charset=utf-8")
         elif path == "/health":
             self._send(200, "OK", "text/plain; charset=utf-8")
@@ -1355,8 +1411,11 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             if isinstance(body, dict) and "autoclean" in body:
                 set_setting("autoclean", "1" if body["autoclean"] else "0")
+            if isinstance(body, dict) and "skipGlobal" in body:
+                set_setting("skip_global", "1" if body["skipGlobal"] else "0")
             ac = get_setting("autoclean", autoclean_default()) == "1"
-            self._send(200, json.dumps({"ok": True, "autoclean": ac},
+            sg = get_setting("skip_global", skip_global_default()) == "1"
+            self._send(200, json.dumps({"ok": True, "autoclean": ac, "skipGlobal": sg},
                                        ensure_ascii=False),
                        "application/json; charset=utf-8")
         else:
