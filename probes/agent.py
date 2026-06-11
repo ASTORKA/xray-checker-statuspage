@@ -35,6 +35,7 @@ import socket
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.request
 
 STATUSPAGE_URL = os.environ.get("STATUSPAGE_URL", "").rstrip("/")
@@ -83,12 +84,28 @@ def fetch_geo():
 
 def fetch_targets():
     """GET /api/probe/targets с X-Probe-Token. Возвращает список {name,host,port,sni}."""
+    url = STATUSPAGE_URL + "/api/probe/targets"
     req = urllib.request.Request(
-        STATUSPAGE_URL + "/api/probe/targets",
-        headers={"User-Agent": USER_AGENT, "X-Probe-Token": PROBE_TOKEN})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        data = json.loads(r.read().decode("utf-8", "ignore"))
-    return data.get("targets") or []
+        url, headers={"User-Agent": USER_AGENT, "X-Probe-Token": PROBE_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+        return data.get("targets") or []
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            raise RuntimeError(
+                "сервер: PROBE_SUBSCRIPTION_URL не задан (или пуст). "
+                "Добавь его в docker-compose.yml в env statuspage и перезапусти.")
+        if e.code == 401:
+            raise RuntimeError(
+                "сервер: токен пробника отвергнут. Возможно, пробника удалили — "
+                "переустанови через install-macos.sh.")
+        raise RuntimeError("сервер ответил HTTP %d" % e.code)
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            "сеть: не достучаться до %s — %s. Проверь, что STATUSPAGE_URL "
+            "правильный (открой в браузере — должна быть видна статус-страница)."
+            % (STATUSPAGE_URL, e.reason))
 
 
 def tls_probe(host, port, sni):
@@ -153,8 +170,7 @@ def one_cycle():
     try:
         targets = fetch_targets()
     except Exception as e:
-        err("targets fetch failed:", e,
-            "(возможно PROBE_SUBSCRIPTION_URL не задан на сервере?)")
+        err("targets fetch failed:", e)
         return
     if not targets:
         err("сервер вернул пустой список таргетов")
