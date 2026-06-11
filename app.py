@@ -29,6 +29,13 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 # Сколько часов держать запись в `current`, если xray-checker перестал её отдавать.
 # 0 — авточистку выключить (старое поведение, дубли копятся вручную).
 STALE_AFTER_HOURS = int(os.environ.get("STALE_AFTER_HOURS", "24"))
+# Отсев «глобальных сбоев чекера»: если в одном опросе доля офлайн-прокси >= порога
+# (по умолчанию 1.0 — т.е. ВСЕ офлайн), цикл считается артефактом самого xray-checker
+# (рестарт, сетевой сбой, перечитывание подписки) и НЕ записывается в историю — иначе
+# у всех серверов одновременно копится одинаковый ложный простой. Географически
+# разнесённые серверы не могут отказать в одну секунду — это всегда чекер.
+# Чтобы выключить отсев — задай значение > 1 (например 2).
+GLOBAL_OUTAGE_RATIO = float(os.environ.get("GLOBAL_OUTAGE_RATIO", "1.0"))
 STATIC_CACHE = "public, max-age=31536000, immutable"
 NO_CACHE = "no-cache, no-store, must-revalidate"
 
@@ -252,6 +259,17 @@ def poll_once():
     proxies = fetch_proxies()
     now = int(time.time())
     today = datetime.now(tz()).strftime("%Y-%m-%d")
+
+    # Отсев глобального сбоя чекера: считаем валидные прокси и долю офлайн в этом цикле.
+    valid = [p for p in proxies if (p.get("stableId") or "")]
+    n_valid = len(valid)
+    n_offline = sum(1 for p in valid if not p.get("online"))
+    if n_valid >= 2 and (n_offline / n_valid) >= GLOBAL_OUTAGE_RATIO:
+        print("global-outage: %d/%d прокси офлайн в одном опросе — цикл пропущен "
+              "(артефакт чекера, не записываем в историю)" % (n_offline, n_valid),
+              flush=True)
+        return
+
     with _lock, conn() as c:
         for seq, p in enumerate(proxies):
             sid = p.get("stableId") or ""
