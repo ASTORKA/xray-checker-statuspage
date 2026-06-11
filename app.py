@@ -250,25 +250,38 @@ PROBE_SAMPLE_RETAIN_HOURS = int(os.environ.get("PROBE_SAMPLE_RETAIN_HOURS", "72"
 # Бонусом: секретный URL подписки не светится на устройствах пользователя.
 PROBE_SUBSCRIPTION_URL = os.environ.get("PROBE_SUBSCRIPTION_URL", "").strip()
 PROBE_TARGETS_TTL_MIN = int(os.environ.get("PROBE_TARGETS_TTL_MIN", "10"))
+# Подписки (Remna/Marzban/3x-ui и т.п.) смотрят на User-Agent и отдают разный
+# формат в зависимости от клиента, а для незнакомых — заглушку
+# «Приложение не поддерживается!». Прикидываемся v2rayN — самый универсальный,
+# понимается всеми панелями.
+PROBE_SUBSCRIPTION_USER_AGENT = os.environ.get(
+    "PROBE_SUBSCRIPTION_USER_AGENT", "v2rayN/6.40")
 
 # In-memory кеш разобранных таргетов: чтобы не дёргать подписку каждый раз.
 _targets_cache = {"ts": 0, "data": []}
 _targets_lock = threading.Lock()
 
 
+_PLACEHOLDER_HOSTS = {"0.0.0.0", "127.0.0.1", "::"}
+
+
 def _parse_vless_line(line):
-    """vless://uuid@host:port?sni=...&fp=...#name → {host, port, sni, name} или None."""
+    """vless://uuid@host:port?sni=...&fp=...#name → {host, port, sni, name} или None.
+    Фильтрует «заглушки» подписки (0.0.0.0 и т.п.), которые панели отдают,
+    когда не узнают клиента по User-Agent."""
     if not line.startswith("vless://"):
         return None
     try:
         p = urlparse(line)
         host = p.hostname
         port = p.port or 443
-        if not host:
+        if not host or host in _PLACEHOLDER_HOSTS:
             return None
         from urllib.parse import parse_qs, unquote
         q = parse_qs(p.query)
         sni = (q.get("sni") or q.get("peer") or [host])[0]
+        if sni in _PLACEHOLDER_HOSTS:
+            sni = host
         name = unquote(p.fragment or "").strip() or host
         return {"name": name, "host": host, "port": int(port), "sni": sni}
     except Exception:
@@ -279,7 +292,7 @@ def _fetch_subscription_text():
     """Тянет SUBSCRIPTION_URL, при необходимости декодирует base64."""
     req = urllib.request.Request(
         PROBE_SUBSCRIPTION_URL,
-        headers={"User-Agent": "xrs-statuspage/1.0 (probe-targets)"})
+        headers={"User-Agent": PROBE_SUBSCRIPTION_USER_AGENT})
     with urllib.request.urlopen(req, timeout=20) as r:
         raw = r.read().decode("utf-8", "ignore").strip()
     # Подписки часто base64. Если в raw нет prefix'ов — декодируем.
