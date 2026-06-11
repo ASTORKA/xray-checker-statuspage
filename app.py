@@ -199,6 +199,21 @@ def init_db():
         c.execute("DROP TABLE IF EXISTS hidden")
         c.execute("""CREATE TABLE IF NOT EXISTS settings(
             k TEXT PRIMARY KEY, v TEXT)""")
+        # Региональные пробники: устройства в зоне блокировки (РФ), которые тестят
+        # прокси-конфиги локальным TLS-handshake'ом — чтобы детектить ban'ы по
+        # фингерпринту/SNI/IP, которые с облачного чекера не видны.
+        c.execute("""CREATE TABLE IF NOT EXISTS probes(
+            probe_id TEXT PRIMARY KEY,
+            name TEXT,
+            token_hash TEXT,
+            created_at INTEGER,
+            last_seen INTEGER,
+            last_geo TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS probe_samples(
+            ts INTEGER, probe_id TEXT, sid TEXT,
+            ok INTEGER, rtt INTEGER, err TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_probe_sid_ts ON probe_samples(sid, ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_probe_pid_ts ON probe_samples(probe_id, ts)")
 
 
 def _get_setting_c(c, k, default=None):
@@ -220,6 +235,131 @@ def set_setting(k, v):
 
 def autoclean_default():
     return "1" if STALE_AFTER_HOURS > 0 else "0"
+
+
+# ---- Региональные пробники ------------------------------------------------------
+
+# За какое окно (мин) считаем sample пробника «свежим» для статуса на странице.
+# Старее этого — UI рисует серую точку «нет связи».
+PROBE_FRESH_MINUTES = int(os.environ.get("PROBE_FRESH_MINUTES", "10"))
+PROBE_SAMPLE_RETAIN_HOURS = int(os.environ.get("PROBE_SAMPLE_RETAIN_HOURS", "72"))
+
+
+def _gen_probe_id():
+    return "p-" + os.urandom(4).hex()
+
+
+def _gen_probe_token():
+    return os.urandom(24).hex()
+
+
+def _hash_token(t):
+    import hashlib
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+def find_probe_by_token(token):
+    """Возвращает (probe_id, name) или None."""
+    if not token:
+        return None
+    th = _hash_token(token)
+    with _lock, conn() as c:
+        row = c.execute("SELECT probe_id, name FROM probes WHERE token_hash=?",
+                        (th,)).fetchone()
+    return row if row else None
+
+
+def create_probe(name):
+    name = (name or "").strip() or "probe"
+    pid = _gen_probe_id()
+    tok = _gen_probe_token()
+    now = int(time.time())
+    with _lock, conn() as c:
+        c.execute("""INSERT INTO probes(probe_id, name, token_hash, created_at)
+                     VALUES(?,?,?,?)""",
+                  (pid, name, _hash_token(tok), now))
+    return {"probe_id": pid, "name": name, "probe_token": tok, "created_at": now}
+
+
+def list_probes():
+    t = tz()
+    with _lock, conn() as c:
+        rows = c.execute(
+            "SELECT probe_id, name, created_at, last_seen, last_geo "
+            "FROM probes ORDER BY created_at DESC").fetchall()
+    out = []
+    for pid, name, ca, ls, geo in rows:
+        out.append({
+            "probe_id": pid, "name": name,
+            "createdAt": datetime.fromtimestamp(ca, t).strftime("%Y-%m-%d %H:%M") if ca else "",
+            "lastSeen": datetime.fromtimestamp(ls, t).strftime("%Y-%m-%d %H:%M") if ls else None,
+            "lastSeenTs": ls or 0,
+            "geo": geo or "",
+        })
+    return out
+
+
+def delete_probe(pid):
+    if not pid:
+        return False
+    with _lock, conn() as c:
+        cur = c.execute("DELETE FROM probes WHERE probe_id=?", (pid,))
+        c.execute("DELETE FROM probe_samples WHERE probe_id=?", (pid,))
+        return cur.rowcount > 0
+
+
+def save_probe_report(probe_id, geo, results):
+    """Принимает список {name|sid, ok, rtt, err} от пробника, мапит name→canon_sid,
+    пишет в probe_samples и обновляет last_seen/last_geo пробника.
+
+    Если пробник прислал несколько результатов с одним `name` (для разных
+    sub-серверов одной группы — альтернирующий роутинг), мерджим по логике
+    «любой ok → группа ok», rtt = минимум среди ok-членов."""
+    now = int(time.time())
+    saved = 0
+    with _lock, conn() as c:
+        # Карта name → canonical sid (минимальный seq среди членов группы).
+        name_to_sid = {}
+        for sid, name, seq in c.execute("SELECT sid, name, seq FROM current").fetchall():
+            cur = name_to_sid.get(name)
+            if cur is None or seq < cur[1]:
+                name_to_sid[name] = (sid, seq)
+        # Сначала разрешаем sid для каждого результата, потом мерджим по sid.
+        merged = {}  # sid -> {ok, rtt, err}
+        for r in results or []:
+            sid = (r.get("sid") or "").strip()
+            if not sid:
+                nm = (r.get("name") or "").strip()
+                pair = name_to_sid.get(nm)
+                if not pair:
+                    continue
+                sid = pair[0]
+            ok = bool(r.get("ok"))
+            rtt = int(r.get("rtt") or 0)
+            err = (r.get("err") or "")[:200] if not ok else ""
+            cur = merged.get(sid)
+            if cur is None:
+                merged[sid] = {"ok": ok, "rtt": rtt, "err": err}
+            else:
+                if ok and not cur["ok"]:
+                    cur["ok"] = True
+                    cur["rtt"] = rtt
+                    cur["err"] = ""
+                elif ok and cur["ok"]:
+                    if rtt > 0 and (cur["rtt"] == 0 or rtt < cur["rtt"]):
+                        cur["rtt"] = rtt
+                # if not ok — оставляем как есть; либо там уже ok, либо тоже не ok
+        for sid, m in merged.items():
+            c.execute(
+                "INSERT INTO probe_samples(ts, probe_id, sid, ok, rtt, err) "
+                "VALUES(?,?,?,?,?,?)",
+                (now, probe_id, sid, 1 if m["ok"] else 0, m["rtt"], m["err"]))
+            saved += 1
+        c.execute("UPDATE probes SET last_seen=?, last_geo=? WHERE probe_id=?",
+                  (now, (geo or "")[:8], probe_id))
+        c.execute("DELETE FROM probe_samples WHERE ts < ?",
+                  (now - PROBE_SAMPLE_RETAIN_HOURS * 3600,))
+    return saved
 
 
 def skip_global_default():
@@ -372,10 +512,38 @@ def build_summary():
             "SELECT sid,name,online,latency,ts,seq FROM current ORDER BY seq").fetchall()
         daily_rows = c.execute(
             "SELECT sid,day,up,down,lat_sum,lat_cnt,down_conf FROM daily").fetchall()
+        # Свежие пробы от региональных пробников: за последние PROBE_FRESH_MINUTES.
+        # Для каждой пары (sid, probe_id) берём самый свежий sample.
+        probe_cutoff = int(time.time()) - PROBE_FRESH_MINUTES * 60
+        probe_rows = c.execute(
+            "SELECT ts, probe_id, sid, ok, rtt, err FROM probe_samples WHERE ts >= ?",
+            (probe_cutoff,)).fetchall()
+        probe_names = dict(c.execute(
+            "SELECT probe_id, name FROM probes").fetchall())
 
     by_sid = {}
     for sid, day, up, down, lat_sum, lat_cnt, down_conf in daily_rows:
         by_sid.setdefault(sid, {})[day] = (up, down, lat_sum, lat_cnt, down_conf or 0)
+
+    latest_probe = {}  # (sid, probe_id) -> (ts, ok, rtt, err)
+    for ts, pid, sid, ok, rtt, err in probe_rows:
+        key = (sid, pid)
+        cur = latest_probe.get(key)
+        if cur is None or ts > cur[0]:
+            latest_probe[key] = (ts, ok, rtt, err)
+    probes_by_sid = {}
+    for (sid, pid), (ts, ok, rtt, err) in latest_probe.items():
+        probes_by_sid.setdefault(sid, []).append({
+            "probe_id": pid,
+            "name": probe_names.get(pid, pid),
+            "ok": bool(ok),
+            "rtt": int(rtt or 0),
+            "err": err or "",
+            "ts": ts,
+        })
+    # Сортируем по имени, чтобы маркеры были стабильны между обновлениями.
+    for arr in probes_by_sid.values():
+        arr.sort(key=lambda x: x["name"])
 
     # Группируем sid'ы по raw `name`. Один и тот же хост в xray-checker может
     # быть представлен несколькими sub-серверами под общим роутингом —
@@ -447,6 +615,17 @@ def build_summary():
             if canon_latency > 0:
                 lat_vals.append(canon_latency)
         cc = detect_country(name)
+        # Пробы — собираем со ВСЕХ членов группы, а не только canonical, потому что
+        # при чередовании sid пробник мог за окно репортить несколько (для разных sid
+        # одного хоста). Из каждой пары (probe_id, sid) уже выбран самый свежий выше;
+        # тут ещё раз свернём по probe_id: оставляем самую свежую запись по хосту.
+        gp = {}
+        for m in members:
+            for pr in probes_by_sid.get(m[0], []):
+                cur = gp.get(pr["probe_id"])
+                if cur is None or pr["ts"] > cur["ts"]:
+                    gp[pr["probe_id"]] = pr
+        probes_arr = sorted(gp.values(), key=lambda x: x["name"])
         out_servers.append({
             "sid": canon_sid,
             "name": display_name(name, cc),
@@ -457,6 +636,7 @@ def build_summary():
             "downMin30": s_down_min,
             "days": days,
             "members": len(members),
+            "probes": probes_arr,
         })
         tot_up += s_up
         tot_total += s_total
@@ -716,6 +896,13 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .actoggle.actogon{background:var(--ok);}
 .actoggle.actogon::before{transform:translateX(20px);}
 .actoggle:disabled{opacity:.45;cursor:not-allowed;}
+.prblist{display:flex;gap:8px 14px;padding:6px 15px 11px;flex-wrap:wrap;
+  border-top:1px dashed var(--line);margin:2px 0 0;}
+.prb{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--tx3);cursor:default;}
+.prbDot{width:7px;height:7px;border-radius:50%;flex:none;}
+.prbOk{background:var(--ok);}
+.prbBad{background:var(--bad);}
+.prb b{font-weight:500;color:var(--tx2);}
 @media (max-width:560px){
   .wrap{padding:22px 14px 40px;}
   .brand h1{font-size:18px;} .brand p{font-size:12px;}
@@ -971,6 +1158,32 @@ function applyServer(item,s,days){
   item._p.textContent=(s.uptime30===null)?"—":s.uptime30.toFixed(2)+"%";
   item._p.style.color=srvUpColor(s.uptime30);
   item._s2.textContent=(s.latencyMs?s.latencyMs+" ms · ":"")+days+" дн";
+  applyProbes(item,s.probes);
+}
+function applyProbes(item,probes){
+  var ex=item._prblist;
+  if(ex){ex.remove();item._prblist=null;}
+  if(!probes||!probes.length)return;
+  var list=document.createElement("div");list.className="prblist";
+  probes.forEach(function(p){
+    var span=document.createElement("span");span.className="prb";
+    var dot=document.createElement("span");
+    dot.className="prbDot "+(p.ok?"prbOk":"prbBad");
+    span.appendChild(dot);
+    span.appendChild(document.createTextNode(p.name));
+    if(p.ok&&p.rtt>0){
+      var b=document.createElement("b");b.textContent=p.rtt+" ms";
+      span.appendChild(document.createTextNode(" "));
+      span.appendChild(b);
+    }else if(!p.ok&&p.err){
+      span.title=p.err;
+    }
+    list.appendChild(span);
+  });
+  // Вставляем между .row и .panel
+  if(item._panel)item.insertBefore(list,item._panel);
+  else item.appendChild(list);
+  item._prblist=list;
 }
 function buildList(data){
   var list=document.getElementById("list");
@@ -1228,7 +1441,8 @@ _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "tyaxis", "tstats", "taxis", "phead", "sdot",
                 "overall", "pgrad",
                 "delbtn", "lockon", "lock",
-                "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked"]
+                "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked",
+                "prblist", "prbDot", "prbOk", "prbBad", "prb"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
@@ -1369,8 +1583,35 @@ class Handler(BaseHTTPRequestHandler):
                 "globalRatio": GLOBAL_OUTAGE_RATIO,
                 "skipGlobalLocked": GLOBAL_OUTAGE_RATIO > 1.0,
             }, ensure_ascii=False), "application/json; charset=utf-8")
+        elif path == "/api/admin/probes":
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            self._send(200,
+                       json.dumps({"probes": list_probes(),
+                                   "freshMinutes": PROBE_FRESH_MINUTES},
+                                  ensure_ascii=False),
+                       "application/json; charset=utf-8")
         elif path == "/health":
             self._send(200, "OK", "text/plain; charset=utf-8")
+        else:
+            self._send(404, "Not Found", "text/plain; charset=utf-8")
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        # Удаление пробника по probe_id: DELETE /api/admin/probes/<probe_id>
+        if path.startswith("/api/admin/probes/"):
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            pid = path[len("/api/admin/probes/"):].strip("/")
+            ok = delete_probe(pid)
+            self._send(200,
+                       json.dumps({"ok": True, "deleted": ok}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
         else:
             self._send(404, "Not Found", "text/plain; charset=utf-8")
 
@@ -1417,6 +1658,39 @@ class Handler(BaseHTTPRequestHandler):
             sg = get_setting("skip_global", skip_global_default()) == "1"
             self._send(200, json.dumps({"ok": True, "autoclean": ac, "skipGlobal": sg},
                                        ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/admin/probes":
+            # Создать нового пробника. Возвращает probe_id + probe_token
+            # (токен показывается ОДИН раз — потом только хеш).
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            body = self._read_json()
+            name = (body.get("name") if isinstance(body, dict) else "") or ""
+            probe = create_probe(name)
+            self._send(200,
+                       json.dumps({"ok": True, **probe}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/probe/report":
+            # Приём отчёта от пробника. Аутентификация — X-Probe-Token.
+            token = self.headers.get("X-Probe-Token", "") or ""
+            p = find_probe_by_token(token)
+            if not p:
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            probe_id, probe_name = p
+            body = self._read_json()
+            if not isinstance(body, dict):
+                body = {}
+            geo = (body.get("geo") or "").strip()
+            results = body.get("results") or []
+            n = save_probe_report(probe_id, geo, results)
+            self._send(200,
+                       json.dumps({"ok": True, "saved": n,
+                                   "probe": {"id": probe_id, "name": probe_name}},
+                                  ensure_ascii=False),
                        "application/json; charset=utf-8")
         else:
             self._send(404, "Not Found", "text/plain; charset=utf-8")

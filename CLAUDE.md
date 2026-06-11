@@ -232,6 +232,65 @@ Forward-only: уже накопленный ложный простой задн
 - `find_brand_image()` ищет файл `favicon*` (png/svg/ico/jpg/webp) в `data/` → отдаётся
   как favicon и лого в шапке. Нет файла → дефолтный SVG-щит.
 
+### 11. Региональные пробники
+
+**Проблема:** облачный xray-checker сидит вне зоны блокировок и пишет «всё ОК» даже когда
+конфиг забанен в РФ по фингерпринту/SNI/IP. Чтобы это видеть, на устройствах в РФ
+ставится **probe-агент** (`probes/agent.py`), который локально делает TLS handshake к
+каждому прокси-конфигу из подписки и репортит результат на наш сервер.
+
+**Таблицы:**
+- `probes(probe_id PK, name, token_hash, created_at, last_seen, last_geo)` —
+  зарегистрированные пробники; `token_hash` — SHA-256 от probe_token (сам токен не
+  хранится).
+- `probe_samples(ts, probe_id, sid, ok, rtt, err)` — результаты проверок. Чистится по
+  `PROBE_SAMPLE_RETAIN_HOURS` (default 72ч).
+
+**Эндпоинты:**
+
+| Метод+путь | Auth | Действие |
+|---|---|---|
+| `POST /api/admin/probes` `{name}` | `X-Admin-Token` | создать пробник, вернуть `probe_id` + `probe_token` (один раз) |
+| `GET /api/admin/probes` | `X-Admin-Token` | список с `last_seen`/`last_geo` |
+| `DELETE /api/admin/probes/<id>` | `X-Admin-Token` | удалить + каскад на `probe_samples` |
+| `POST /api/probe/report` | `X-Probe-Token` | приём отчёта `{geo, results: [...]}` |
+
+`save_probe_report`:
+- мапит входящие `name` → `canonical sid` группы (минимальный `seq` среди членов),
+- если для одного `sid` пришло несколько результатов (несколько sub-серверов с одним
+  `name`) — мерджит «любой ok → группа ok», `rtt = min(ok-only)`,
+- обновляет `last_seen`/`last_geo` пробника.
+
+**В `build_summary`:** одним запросом тянем все `probe_samples` за окно
+`PROBE_FRESH_MINUTES` (default 10), в Python оставляем последнюю запись по каждой паре
+`(sid, probe_id)`, потом группируем по группе серверов. К каждой строке добавляется поле
+`probes: [{probe_id, name, ok, rtt, err, ts}]`. Старее окна — игнор.
+
+**Frontend:** `applyProbes(item, probes)` снизу строки добавляет `.prblist` с цветными
+точками (`prbOk`/`prbBad`) + именем + RTT, ошибка в `title=` тултипе.
+
+**Агент (`probes/agent.py`):** автономный однофайловый Python-скрипт, только stdlib.
+- ENV: `STATUSPAGE_URL`, `PROBE_TOKEN`, `SUBSCRIPTION_URL`, `INTERVAL=60`, `TIMEOUT=10`,
+  `EXPECT_COUNTRY=RU`, `GEO_CHECK_URL`.
+- Цикл: geo-check (`ifconfig.co/country-iso` с fallback на unverified SSL) → fetch
+  подписки (auto-decode base64) → парсит vless:// → для каждого TLS handshake к
+  `host:port` с правильным SNI (verify=NONE — REALITY это норма) → POST на статус.
+- vmess/trojan пока не парсятся (MVP).
+
+**Установка на macOS (`probes/install-macos.sh`):** интерактивно/через env собирает
+URL'ы и `ADMIN_TOKEN`, регистрирует пробника на сервере, кладёт `agent.py` в
+`~/.xrs-probe/`, регистрирует LaunchAgent `~/Library/LaunchAgents/com.xrs.probe.plist`
+(env-переменные внутри plist), `launchctl bootstrap`. Логи в `~/Library/Logs/xrs-probe.log`.
+`--uninstall` — обратное.
+
+**Безопасность:**
+- `probe_token` хранится только в `token_hash` (SHA-256); показывается пользователю один
+  раз при создании. На проверке (`find_probe_by_token`) хешируем входящий токен и ищем
+  в `probes` по `token_hash` — timing-atака нерелевантна, т.к. секрет = хеш + поиск по
+  индексу + утечка крайне узкая по сравнению с временем хеширования.
+- На пробнике токен лежит в plist в plain text (это машина пользователя, plist
+  доступен только владельцу).
+
 ## Жизненный цикл (main)
 
 `main()`: `init_db()` → запускает `ensure_fonts()` и `poller()` в потоках → поднимает
