@@ -5,9 +5,11 @@
 #
 # Использование:
 #   bash install-macos.sh           # интерактивный режим
-#   STATUSPAGE_URL=... ADMIN_TOKEN=... SUBSCRIPTION_URL=... bash install-macos.sh
+#   STATUSPAGE_URL=... ADMIN_TOKEN=... bash install-macos.sh
 #   bash install-macos.sh --uninstall
 #
+# Подписку (URL прокси-конфигов) задаёт владелец сервера через env
+# PROBE_SUBSCRIPTION_URL — на устройство пользователя она НЕ попадает.
 set -euo pipefail
 
 LABEL="com.xrs.probe"
@@ -46,15 +48,14 @@ c_g "== xray-checker-statuspage probe agent (macOS) =="
 echo
 
 [ -n "${STATUSPAGE_URL:-}" ] || STATUSPAGE_URL="$(ask 'URL статус-страницы (https://...)')"
-[ -n "${SUBSCRIPTION_URL:-}" ] || SUBSCRIPTION_URL="$(ask 'URL подписки (тот же, что у xray-checker)')"
 [ -n "${ADMIN_TOKEN:-}" ] || ADMIN_TOKEN="$(asks 'ADMIN_TOKEN статус-страницы')"
 DEFAULT_NAME="Mac-$(scutil --get ComputerName 2>/dev/null || hostname -s || echo "$(whoami)")"
 [ -n "${PROBE_NAME:-}" ] || PROBE_NAME="$(ask 'Имя пробника' "${DEFAULT_NAME}")"
 INTERVAL="${INTERVAL:-60}"
 EXPECT_COUNTRY="${EXPECT_COUNTRY:-RU}"
 
-[ -n "${STATUSPAGE_URL}" ] && [ -n "${SUBSCRIPTION_URL}" ] && [ -n "${ADMIN_TOKEN}" ] \
-  || die "URL статус-страницы, подписки и ADMIN_TOKEN обязательны."
+[ -n "${STATUSPAGE_URL}" ] && [ -n "${ADMIN_TOKEN}" ] \
+  || die "URL статус-страницы и ADMIN_TOKEN обязательны."
 
 STATUSPAGE_URL="${STATUSPAGE_URL%/}"
 
@@ -106,7 +107,6 @@ cat > "${PLIST}" <<EOF
   <dict>
     <key>STATUSPAGE_URL</key><string>${STATUSPAGE_URL}</string>
     <key>PROBE_TOKEN</key><string>${PROBE_TOKEN}</string>
-    <key>SUBSCRIPTION_URL</key><string>${SUBSCRIPTION_URL}</string>
     <key>INTERVAL</key><string>${INTERVAL}</string>
     <key>EXPECT_COUNTRY</key><string>${EXPECT_COUNTRY}</string>
   </dict>

@@ -253,7 +253,14 @@ Forward-only: уже накопленный ложный простой задн
 | `POST /api/admin/probes` `{name}` | `X-Admin-Token` | создать пробник, вернуть `probe_id` + `probe_token` (один раз) |
 | `GET /api/admin/probes` | `X-Admin-Token` | список с `last_seen`/`last_geo` |
 | `DELETE /api/admin/probes/<id>` | `X-Admin-Token` | удалить + каскад на `probe_samples` |
+| `GET /api/probe/targets` | `X-Probe-Token` | список таргетов (host/port/sni/name) из `PROBE_SUBSCRIPTION_URL`, кеш на `PROBE_TARGETS_TTL_MIN` |
 | `POST /api/probe/report` | `X-Probe-Token` | приём отчёта `{geo, results: [...]}` |
+
+**Подписка живёт на сервере.** Подписка часто доступна только через VPN — агент в зоне
+блокировки до неё не достучится. Сервер в облаке тянет её через `_fetch_subscription_text`
+(auto-decode base64), парсит `_parse_vless_line`, кеширует в `_targets_cache` под
+`_targets_lock`. На ошибке тянемки возвращает прошлый кеш. Бонус: секретный URL
+подписки не светится на устройствах пользователя.
 
 `save_probe_report`:
 - мапит входящие `name` → `canonical sid` группы (минимальный `seq` среди членов),
@@ -270,12 +277,12 @@ Forward-only: уже накопленный ложный простой задн
 точками (`prbOk`/`prbBad`) + именем + RTT, ошибка в `title=` тултипе.
 
 **Агент (`probes/agent.py`):** автономный однофайловый Python-скрипт, только stdlib.
-- ENV: `STATUSPAGE_URL`, `PROBE_TOKEN`, `SUBSCRIPTION_URL`, `INTERVAL=60`, `TIMEOUT=10`,
-  `EXPECT_COUNTRY=RU`, `GEO_CHECK_URL`.
-- Цикл: geo-check (`ifconfig.co/country-iso` с fallback на unverified SSL) → fetch
-  подписки (auto-decode base64) → парсит vless:// → для каждого TLS handshake к
-  `host:port` с правильным SNI (verify=NONE — REALITY это норма) → POST на статус.
-- vmess/trojan пока не парсятся (MVP).
+- ENV: `STATUSPAGE_URL`, `PROBE_TOKEN`, `INTERVAL=60`, `TIMEOUT=10`, `EXPECT_COUNTRY=RU`,
+  `GEO_CHECK_URL`. **URL подписки на агенте не задаётся** — таргеты приходят с сервера.
+- Цикл: geo-check (`ifconfig.co/country-iso` с fallback на unverified SSL) → GET
+  `/api/probe/targets` (X-Probe-Token) → для каждого таргета TLS handshake к `host:port`
+  с правильным SNI (verify=NONE — REALITY это норма) → POST на сервер.
+- vmess/trojan пока не парсятся на сервере (MVP).
 
 **Установка на macOS (`probes/install-macos.sh`):** интерактивно/через env собирает
 URL'ы и `ADMIN_TOKEN`, регистрирует пробника на сервере, кладёт `agent.py` в

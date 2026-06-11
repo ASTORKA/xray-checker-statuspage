@@ -243,6 +243,81 @@ def autoclean_default():
 # Старее этого — UI рисует серую точку «нет связи».
 PROBE_FRESH_MINUTES = int(os.environ.get("PROBE_FRESH_MINUTES", "10"))
 PROBE_SAMPLE_RETAIN_HOURS = int(os.environ.get("PROBE_SAMPLE_RETAIN_HOURS", "72"))
+# URL подписки для пробников. Если задан, сервер сам тянет/парсит её и отдаёт
+# пробникам разобранный список таргетов через /api/probe/targets — пробник
+# больше не лезет в подписку напрямую. Это нужно когда подписка доступна
+# только через VPN (агент в РФ не достучится), а сервер в облаке — может.
+# Бонусом: секретный URL подписки не светится на устройствах пользователя.
+PROBE_SUBSCRIPTION_URL = os.environ.get("PROBE_SUBSCRIPTION_URL", "").strip()
+PROBE_TARGETS_TTL_MIN = int(os.environ.get("PROBE_TARGETS_TTL_MIN", "10"))
+
+# In-memory кеш разобранных таргетов: чтобы не дёргать подписку каждый раз.
+_targets_cache = {"ts": 0, "data": []}
+_targets_lock = threading.Lock()
+
+
+def _parse_vless_line(line):
+    """vless://uuid@host:port?sni=...&fp=...#name → {host, port, sni, name} или None."""
+    if not line.startswith("vless://"):
+        return None
+    try:
+        p = urlparse(line)
+        host = p.hostname
+        port = p.port or 443
+        if not host:
+            return None
+        from urllib.parse import parse_qs, unquote
+        q = parse_qs(p.query)
+        sni = (q.get("sni") or q.get("peer") or [host])[0]
+        name = unquote(p.fragment or "").strip() or host
+        return {"name": name, "host": host, "port": int(port), "sni": sni}
+    except Exception:
+        return None
+
+
+def _fetch_subscription_text():
+    """Тянет SUBSCRIPTION_URL, при необходимости декодирует base64."""
+    req = urllib.request.Request(
+        PROBE_SUBSCRIPTION_URL,
+        headers={"User-Agent": "xrs-statuspage/1.0 (probe-targets)"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read().decode("utf-8", "ignore").strip()
+    # Подписки часто base64. Если в raw нет prefix'ов — декодируем.
+    if "vless://" not in raw and "vmess://" not in raw and "trojan://" not in raw:
+        try:
+            import base64 as _b64
+            padded = raw + "=" * (-len(raw) % 4)
+            decoded = _b64.b64decode(padded).decode("utf-8", "ignore")
+            if "vless://" in decoded or "vmess://" in decoded:
+                raw = decoded
+        except Exception:
+            pass
+    return raw
+
+
+def get_probe_targets():
+    """С кешированием на PROBE_TARGETS_TTL_MIN минут возвращает список таргетов.
+    На ошибке тянемки — возвращает прошлый кеш (если был)."""
+    if not PROBE_SUBSCRIPTION_URL:
+        return []
+    now = int(time.time())
+    with _targets_lock:
+        if (now - _targets_cache["ts"] < PROBE_TARGETS_TTL_MIN * 60
+                and _targets_cache["data"]):
+            return _targets_cache["data"]
+        try:
+            raw = _fetch_subscription_text()
+            targets = []
+            for line in raw.splitlines():
+                t = _parse_vless_line(line.strip())
+                if t:
+                    targets.append(t)
+            _targets_cache["ts"] = now
+            _targets_cache["data"] = targets
+            return targets
+        except Exception as e:
+            print("probe targets fetch failed:", e, flush=True)
+            return _targets_cache["data"]
 
 
 def _gen_probe_id():
@@ -1591,6 +1666,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200,
                        json.dumps({"probes": list_probes(),
                                    "freshMinutes": PROBE_FRESH_MINUTES},
+                                  ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/probe/targets":
+            # Список таргетов для пробника. Аутентификация — X-Probe-Token.
+            # Сервер сам тянет подписку (см. PROBE_SUBSCRIPTION_URL), парсит
+            # vless-конфиги, отдаёт {host, port, sni, name}. Кеш TTL — 10 мин.
+            token = self.headers.get("X-Probe-Token", "") or ""
+            p = find_probe_by_token(token)
+            if not p:
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            if not PROBE_SUBSCRIPTION_URL:
+                self._send(503,
+                    '{"error":"PROBE_SUBSCRIPTION_URL не задан на сервере"}',
+                    "application/json; charset=utf-8")
+                return
+            targets = get_probe_targets()
+            self._send(200,
+                       json.dumps({"targets": targets,
+                                   "fetchedAt": _targets_cache["ts"]},
                                   ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path == "/health":

@@ -3,46 +3,42 @@
 xray-checker-statuspage probe agent (TLS handshake, MVP)
 
 Что делает:
-  1. Раз в INTERVAL секунд тянет подписку (SUBSCRIPTION_URL),
-  2. Парсит из неё все vless:// конфиги (поддержка REALITY/TLS),
-  3. Для каждого делает TCP+TLS handshake к host:port с правильным SNI,
-  4. Отправляет результаты на STATUSPAGE_URL/api/probe/report.
+  1. Раз в INTERVAL секунд тянет список таргетов с сервера статус-страницы
+     (GET /api/probe/targets под X-Probe-Token) — сервер сам парсит
+     подписку и отдаёт уже разобранные {name, host, port, sni}.
+  2. Для каждого таргета делает TCP+TLS handshake к host:port с правильным SNI.
+  3. Отправляет результаты на STATUSPAGE_URL/api/probe/report.
 
-При каждом цикле сначала проверяет, в какой стране сейчас сидит агент
-(ifconfig.co/country-iso) — если страна не совпадает с EXPECT_COUNTRY,
-репорт уходит с пометкой и сервер его рисует серым «нет данных» (зависит
-от настройки сервера; на MVP — просто помечаем в поле geo).
+Почему агент НЕ тянет подписку напрямую: подписка обычно лежит за VPN,
+агенту в зоне блокировки она не доступна без туннеля. Сервер в облаке
+тянет её и отдаёт уже распарсенной. Бонусом — секретный URL подписки не
+светится на устройстве пользователя.
+
+В начале каждого цикла проверяет свою геолокацию (ifconfig.co/country-iso).
+Если страна не совпадает с EXPECT_COUNTRY, в лог пишется warning — но
+репорт всё равно уходит (только с пометкой `geo` для UI).
 
 Конфиг — через переменные окружения:
   STATUSPAGE_URL     обязательно   куда репортить (https://status.example.com)
   PROBE_TOKEN        обязательно   токен пробника (выдаётся при регистрации)
-  SUBSCRIPTION_URL   обязательно   откуда тянуть конфиги для теста
   INTERVAL           60            секунды между циклами
   TIMEOUT            10            таймаут TCP+TLS handshake (сек)
   EXPECT_COUNTRY     RU            ожидаемая страна пробника
   GEO_CHECK_URL      https://ifconfig.co/country-iso
 
 Запуск:
-  STATUSPAGE_URL=https://... PROBE_TOKEN=... SUBSCRIPTION_URL=... \\
-    python3 agent.py
-
-При нормальной работе пишет одну строку в stdout на цикл: «cycle: N тестов,
-M ok». Ошибки уходят в stderr. Запускать через launchd на macOS — см.
-install-macos.sh.
+  STATUSPAGE_URL=https://... PROBE_TOKEN=... python3 agent.py
 """
-import base64
 import json
 import os
 import socket
 import ssl
 import sys
 import time
-import urllib.parse
 import urllib.request
 
 STATUSPAGE_URL = os.environ.get("STATUSPAGE_URL", "").rstrip("/")
 PROBE_TOKEN = os.environ.get("PROBE_TOKEN", "").strip()
-SUBSCRIPTION_URL = os.environ.get("SUBSCRIPTION_URL", "").strip()
 INTERVAL = int(os.environ.get("INTERVAL", "60"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "10"))
 EXPECT_COUNTRY = os.environ.get("EXPECT_COUNTRY", "RU").strip().upper()
@@ -85,44 +81,14 @@ def fetch_geo():
                 return ""
 
 
-def fetch_subscription():
-    raw = http_get(SUBSCRIPTION_URL, timeout=20)
-    text = raw.decode("utf-8", "ignore").strip()
-    # Подписки обычно — base64-encoded список строк-URL. Пробуем декодировать.
-    if "vless://" not in text and "vmess://" not in text and "trojan://" not in text:
-        try:
-            padded = text + "=" * (-len(text) % 4)
-            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
-            if "vless://" in decoded or "vmess://" in decoded:
-                text = decoded
-        except Exception:
-            pass
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
-
-def parse_vless(url):
-    """Парсит vless://uuid@host:port?...#name → dict с host/port/sni/name или None."""
-    if not url.startswith("vless://"):
-        return None
-    try:
-        p = urllib.parse.urlparse(url)
-        host = p.hostname
-        port = p.port or 443
-        if not host:
-            return None
-        q = urllib.parse.parse_qs(p.query)
-        sni = (q.get("sni") or q.get("peer") or [host])[0]
-        # fragment = name; URL-encoded UTF-8
-        name = urllib.parse.unquote(p.fragment or "").strip()
-        security = (q.get("security") or [""])[0]
-        return {
-            "host": host, "port": int(port),
-            "sni": sni, "name": name or host,
-            "security": security,
-        }
-    except Exception as e:
-        err("parse fail:", url[:60], e)
-        return None
+def fetch_targets():
+    """GET /api/probe/targets с X-Probe-Token. Возвращает список {name,host,port,sni}."""
+    req = urllib.request.Request(
+        STATUSPAGE_URL + "/api/probe/targets",
+        headers={"User-Agent": USER_AGENT, "X-Probe-Token": PROBE_TOKEN})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8", "ignore"))
+    return data.get("targets") or []
 
 
 def tls_probe(host, port, sni):
@@ -185,25 +151,25 @@ def one_cycle():
         log("warn: geo=%s, ожидалось %s — возможно включён VPN на этом устройстве"
             % (geo, EXPECT_COUNTRY))
     try:
-        lines = fetch_subscription()
+        targets = fetch_targets()
     except Exception as e:
-        err("subscription fetch failed:", e)
+        err("targets fetch failed:", e,
+            "(возможно PROBE_SUBSCRIPTION_URL не задан на сервере?)")
         return
-    targets = []
-    for line in lines:
-        v = parse_vless(line)
-        if v:
-            targets.append(v)
     if not targets:
-        err("в подписке не найдено vless-конфигов (для MVP поддерживается только vless)")
+        err("сервер вернул пустой список таргетов")
         return
     results = []
     n_ok = 0
     for t in targets:
-        ok, rtt, errmsg = tls_probe(t["host"], t["port"], t["sni"])
+        host = t.get("host"); port = int(t.get("port") or 443)
+        sni = t.get("sni") or host; name = t.get("name") or host
+        if not host:
+            continue
+        ok, rtt, errmsg = tls_probe(host, port, sni)
         if ok:
             n_ok += 1
-        results.append({"name": t["name"], "ok": ok, "rtt": rtt, "err": errmsg})
+        results.append({"name": name, "ok": ok, "rtt": rtt, "err": errmsg})
     try:
         resp = report(geo, results)
         log("cycle: %d тестов, %d ok, geo=%s, saved=%s"
@@ -216,7 +182,6 @@ def main():
     missing = [n for n, v in [
         ("STATUSPAGE_URL", STATUSPAGE_URL),
         ("PROBE_TOKEN", PROBE_TOKEN),
-        ("SUBSCRIPTION_URL", SUBSCRIPTION_URL),
     ] if not v]
     if missing:
         err("обязательные env пусты:", ", ".join(missing))
