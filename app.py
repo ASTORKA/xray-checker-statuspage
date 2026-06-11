@@ -186,47 +186,16 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS samples(
             ts INTEGER, sid TEXT, online INTEGER, latency INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_samples ON samples(sid, ts)")
-        c.execute("""CREATE TABLE IF NOT EXISTS hidden(
-            sid TEXT PRIMARY KEY, name TEXT, ts INTEGER)""")
+        c.execute("DROP TABLE IF EXISTS hidden")
 
 
-def _hidden_sids(c):
-    return {r[0] for r in c.execute("SELECT sid FROM hidden").fetchall()}
-
-
-def list_hidden():
-    t = tz()
-    with _lock, conn() as c:
-        rows = c.execute("SELECT sid, name, ts FROM hidden ORDER BY ts DESC").fetchall()
-    return [{
-        "sid": r[0],
-        "name": r[1] or r[0],
-        "ts": r[2],
-        "hiddenAt": datetime.fromtimestamp(r[2], t).strftime("%Y-%m-%d %H:%M") if r[2] else "",
-    } for r in rows]
-
-
-def hide_server(sid):
+def delete_server(sid):
     if not sid:
         return False
-    now = int(time.time())
     with _lock, conn() as c:
-        row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
-        name = row[0] if row else sid
-        c.execute("INSERT INTO hidden(sid, name, ts) VALUES(?,?,?) "
-                  "ON CONFLICT(sid) DO UPDATE SET name=excluded.name, ts=excluded.ts",
-                  (sid, name, now))
-        c.execute("DELETE FROM current WHERE sid=?", (sid,))
+        cur = c.execute("DELETE FROM current WHERE sid=?", (sid,))
         c.execute("DELETE FROM daily WHERE sid=?", (sid,))
         c.execute("DELETE FROM samples WHERE sid=?", (sid,))
-    return True
-
-
-def unhide_server(sid):
-    if not sid:
-        return False
-    with _lock, conn() as c:
-        cur = c.execute("DELETE FROM hidden WHERE sid=?", (sid,))
         return cur.rowcount > 0
 
 
@@ -245,10 +214,9 @@ def poll_once():
     now = int(time.time())
     today = datetime.now(tz()).strftime("%Y-%m-%d")
     with _lock, conn() as c:
-        hidden = _hidden_sids(c)
         for seq, p in enumerate(proxies):
             sid = p.get("stableId") or ""
-            if not sid or sid in hidden:
+            if not sid:
                 continue
             name = p.get("name") or sid
             online = 1 if p.get("online") else 0
@@ -537,18 +505,6 @@ body{margin:0;background:var(--bg);color:var(--tx);
   margin-left:2px;transition:background .15s,color .15s,border-color .15s;}
 .delbtn:hover{background:rgba(232,80,80,.12);color:var(--bad);border-color:var(--bad);}
 #lock.lockon{background:rgba(47,107,255,.13);color:var(--info);border-color:var(--info);}
-.hidsec{margin-top:22px;background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:14px 18px;box-shadow:var(--shadow);animation:fadeUp .34s ease both;}
-.hidsec h3{margin:0 0 4px;font-size:14px;font-weight:600;color:var(--tx2);}
-.hidsec .hidnote{font-size:12.5px;color:var(--tx3);margin-bottom:6px;}
-.hidrow{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line);font-size:14px;}
-.hidrow:first-of-type{border-top:0;}
-.hidname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.hidts{font-size:12.5px;color:var(--tx3);flex:none;}
-.hidrestore{padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);
-  color:var(--tx2);cursor:pointer;font-size:13px;font-family:inherit;flex:none;
-  transition:background .15s,color .15s,border-color .15s;}
-.hidrestore:hover{background:var(--hover);color:var(--tx);border-color:var(--tx3);}
 @media (max-width:560px){
   .wrap{padding:22px 14px 40px;}
   .brand h1{font-size:18px;} .brand p{font-size:12px;}
@@ -559,8 +515,6 @@ body{margin:0;background:var(--bg);color:var(--tx);
   .stat2{width:auto;text-align:right;}
   .chev{order:4;}
   .delbtn{order:3;}
-  .hidrow{flex-wrap:wrap;gap:6px 12px;}
-  .hidts{font-size:12px;}
   .bars{order:5;flex-basis:100%;height:26px;}
   .legend{gap:9px 14px;margin-top:14px;} .legend .right{display:none;}
   .tstats{gap:12px 22px;} .panel{padding:0 14px;}
@@ -869,10 +823,7 @@ function render(data){
   }
 }
 function load(){
-  fetch("api/summary").then(function(r){return r.json();}).then(function(data){
-    render(data);
-    if(adminMode)loadHidden(); else removeHiddenSec();
-  })
+  fetch("api/summary").then(function(r){return r.json();}).then(render)
   .catch(function(){document.getElementById("list").innerHTML='<div class="skel">Не удалось загрузить данные</div>';});
 }
 var adminEnabled=false, adminMode=false, adminToken="";
@@ -916,56 +867,19 @@ function promptAdminToken(){
 function logoutAdmin(){
   adminToken="";adminMode=false;
   try{localStorage.removeItem("sp-admin-token");}catch(e){}
-  setLockUI();removeHiddenSec();built=false;load();
+  setLockUI();built=false;load();
 }
-function removeHiddenSec(){var el=document.getElementById("hidsec");if(el)el.remove();}
 function deleteServer(sid,name){
-  if(!window.confirm('Удалить сервер «'+name+'» со страницы статуса?\n\nНакопленная статистика будет удалена; при следующем опросе чекер-сервер сам по себе не вернёт его на страницу — пока вы не восстановите его вручную.'))return;
-  fetch("api/admin/hide",{method:"POST",
+  if(!window.confirm('Удалить запись «'+name+'»?\n\nНакопленная статистика по ней будет удалена. Если этот сервер ещё есть в подписке xray-checker, при следующем опросе он снова появится — то есть удаление помогает в первую очередь чистить старые дубли, оставшиеся после смены конфига.'))return;
+  fetch("api/admin/delete",{method:"POST",
     headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
     body:JSON.stringify({sid:sid})})
     .then(function(r){
       if(r.ok){built=false;load();}
       else if(r.status===401){window.alert("Сессия истекла. Войдите заново.");logoutAdmin();}
-      else{window.alert("Не удалось удалить сервер");}
+      else{window.alert("Не удалось удалить запись");}
     })
     .catch(function(){window.alert("Сетевая ошибка");});
-}
-function restoreServer(sid){
-  fetch("api/admin/unhide",{method:"POST",
-    headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
-    body:JSON.stringify({sid:sid})})
-    .then(function(r){
-      if(r.ok){load();}
-      else if(r.status===401){logoutAdmin();}
-    })
-    .catch(function(){});
-}
-function loadHidden(){
-  if(!adminMode){removeHiddenSec();return;}
-  fetch("api/admin/hidden",{headers:{"X-Admin-Token":adminToken}})
-    .then(function(r){return r.ok?r.json():{hidden:[]};})
-    .then(function(data){
-      removeHiddenSec();
-      var items=(data&&data.hidden)||[];
-      if(!items.length)return;
-      var list=document.getElementById("list");if(!list)return;
-      var sec=document.createElement("div");sec.className="hidsec";sec.id="hidsec";
-      var h=document.createElement("h3");h.textContent="Скрытые сервера ("+items.length+")";
-      var note=document.createElement("div");note.className="hidnote";note.textContent="Эти сервера не отображаются на странице и не опрашиваются.";
-      sec.appendChild(h);sec.appendChild(note);
-      items.forEach(function(it){
-        var row=document.createElement("div");row.className="hidrow";
-        var nm=document.createElement("div");nm.className="hidname";nm.textContent=it.name;
-        var ts=document.createElement("div");ts.className="hidts";ts.textContent=it.hiddenAt?("скрыт "+it.hiddenAt):"";
-        var btn=document.createElement("button");btn.type="button";btn.className="hidrestore";btn.textContent="Восстановить";
-        btn.addEventListener("click",function(){restoreServer(it.sid);});
-        row.appendChild(nm);row.appendChild(ts);row.appendChild(btn);
-        sec.appendChild(row);
-      });
-      list.parentNode.insertBefore(sec,list.nextSibling);
-    })
-    .catch(function(){});
 }
 (function(){
   var b=document.getElementById("lock");if(!b)return;
@@ -996,8 +910,7 @@ document.addEventListener("visibilitychange",function(){if(!document.hidden)load
 _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "tyaxis", "tstats", "taxis", "phead", "sdot",
                 "overall", "pgrad",
-                "delbtn", "hidsec", "hidrow", "hidname", "hidts",
-                "hidrestore", "hidnote", "lockon", "lock"]
+                "delbtn", "lockon", "lock"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
@@ -1123,14 +1036,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, blob, "font/woff2", STATIC_CACHE)
             else:
                 self._send(404, "Not Found", "text/plain; charset=utf-8")
-        elif path == "/api/admin/hidden":
-            if not self._is_admin():
-                self._send(401, '{"error":"unauthorized"}',
-                           "application/json; charset=utf-8")
-                return
-            self._send(200,
-                       json.dumps({"hidden": list_hidden()}, ensure_ascii=False),
-                       "application/json; charset=utf-8")
         elif path == "/health":
             self._send(200, "OK", "text/plain; charset=utf-8")
         else:
@@ -1150,7 +1055,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(401, '{"ok":false}',
                            "application/json; charset=utf-8")
-        elif path == "/api/admin/hide":
+        elif path == "/api/admin/delete":
             if not self._is_admin():
                 self._send(401, '{"error":"unauthorized"}',
                            "application/json; charset=utf-8")
@@ -1161,21 +1066,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, '{"error":"sid required"}',
                            "application/json; charset=utf-8")
                 return
-            hide_server(sid)
-            self._send(200, '{"ok":true}', "application/json; charset=utf-8")
-        elif path == "/api/admin/unhide":
-            if not self._is_admin():
-                self._send(401, '{"error":"unauthorized"}',
-                           "application/json; charset=utf-8")
-                return
-            body = self._read_json()
-            sid = (body.get("sid") if isinstance(body, dict) else None) or ""
-            if not sid:
-                self._send(400, '{"error":"sid required"}',
-                           "application/json; charset=utf-8")
-                return
-            unhide_server(sid)
-            self._send(200, '{"ok":true}', "application/json; charset=utf-8")
+            ok = delete_server(sid)
+            self._send(200,
+                       json.dumps({"ok": True, "deleted": ok}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
         else:
             self._send(404, "Not Found", "text/plain; charset=utf-8")
 
