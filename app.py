@@ -357,8 +357,8 @@ def build_summary():
     sorted_groups = sorted(groups.items(), key=lambda kv: min(m[4] for m in kv[1]))
 
     out_servers = []
-    tot_up_cycles = 0.0
-    tot_cycles = 0.0
+    tot_up = 0
+    tot_total = 0
     tot_down_min = 0
     online_count = 0
     lat_vals = []
@@ -366,32 +366,34 @@ def build_summary():
 
     for name, members in sorted_groups:
         days = []
-        s_up_cycles = 0.0
-        s_cycles = 0.0
+        s_up = 0
+        s_total = 0
         s_down_min = 0
         for d in day_list:
-            sum_up = sum_down = 0
-            sum_total = 0
+            # «Наложение графиков»: складываем проверки всех членов группы за день.
+            # Доля аптайма = успешные проверки / все проверки — это корректно и для
+            # чередующихся sid (пока активен один, второй молчит), и для одновременно
+            # опрашиваемых (xray-checker опрашивает всех каждый цикл). Никаких min()/
+            # cap — иначе реальные сбои маскируются, а у 2-членной группы аптайм
+            # удваивается (что и давало ложные 100% и одинаковые значения у всех).
+            sum_up = sum_total = 0
+            sum_down_conf = 0
             n_with_data = 0
             for sid, *_ in members:
                 rec = by_sid.get(sid, {}).get(d)
                 if rec:
                     n_with_data += 1
                     sum_up += rec[0]
-                    sum_down += rec[1]
                     sum_total += rec[0] + rec[1]
-            if sum_total > 0 and n_with_data > 0:
-                # На один цикл опроса приходится N_with_data записей (по одной
-                # на каждого активного в этот день sub-сервера). cycles_d —
-                # количество реальных моментов опроса. up_cycles_d — моменты,
-                # когда хоть один член группы был up (clamp на cycles_d на случай
-                # одновременного up у нескольких членов).
-                cycles_d = sum_total / n_with_data
-                up_cycles_d = min(sum_up, cycles_d)
-                pct = round(up_cycles_d / cycles_d * 100, 2)
-                down_min_d = round((cycles_d - up_cycles_d) * min_per_sample)
-                s_up_cycles += up_cycles_d
-                s_cycles += cycles_d
+                    sum_down_conf += rec[4]
+            if sum_total > 0:
+                pct = round(sum_up / sum_total * 100, 2)
+                # Минуты простоя: confirmed-down проверки → минуты. Делим на число
+                # активных в этот день членов, чтобы при одновременном опросе не
+                # удваивать (для n=1 совпадает со старой формулой).
+                down_min_d = round(sum_down_conf / n_with_data * min_per_sample)
+                s_up += sum_up
+                s_total += sum_total
                 s_down_min += down_min_d
                 has_data = True
             else:
@@ -407,7 +409,7 @@ def build_summary():
         members_by_freshness = sorted(members, key=lambda x: x[3], reverse=True)
         canon_sid, canon_online, canon_latency, canon_ts, _ = members_by_freshness[0]
 
-        up30 = round(s_up_cycles / s_cycles * 100, 2) if s_cycles else None
+        up30 = round(s_up / s_total * 100, 2) if s_total else None
         if canon_ts and canon_ts > last_ts:
             last_ts = canon_ts
         if canon_online:
@@ -426,15 +428,15 @@ def build_summary():
             "days": days,
             "members": len(members),
         })
-        tot_up_cycles += s_up_cycles
-        tot_cycles += s_cycles
+        tot_up += s_up
+        tot_total += s_total
         tot_down_min += s_down_min
 
     avg_lat = round(sum(lat_vals) / len(lat_vals)) if lat_vals else 0
     totals = {
         "online": online_count,
         "total": len(out_servers),
-        "uptime30": round(tot_up_cycles / tot_cycles * 100, 2) if tot_cycles else None,
+        "uptime30": round(tot_up / tot_total * 100, 2) if tot_total else None,
         "avgLatency": avg_lat,
         "downMin30": tot_down_min,
     }
