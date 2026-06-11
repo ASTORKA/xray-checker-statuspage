@@ -216,13 +216,26 @@ def autoclean_default():
 
 
 def delete_server(sid):
+    """Удаляет всю группу записей с тем же `name`, что и у переданного `sid`.
+
+    Один и тот же хост в xray-checker может быть представлен несколькими
+    `stableId` (sub-серверы под общим роутингом): у них совпадает `name`, а
+    опрашиваются они по очереди. Логически это один хост, поэтому ручное
+    удаление должно затрагивать всю группу, иначе остались бы «полу-призраки»."""
     if not sid:
-        return False
+        return 0
     with _lock, conn() as c:
-        cur = c.execute("DELETE FROM current WHERE sid=?", (sid,))
-        c.execute("DELETE FROM daily WHERE sid=?", (sid,))
-        c.execute("DELETE FROM samples WHERE sid=?", (sid,))
-        return cur.rowcount > 0
+        row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
+        if not row:
+            return 0
+        name = row[0]
+        members = [r[0] for r in c.execute(
+            "SELECT sid FROM current WHERE name=?", (name,)).fetchall()]
+        for s in members:
+            c.execute("DELETE FROM current WHERE sid=?", (s,))
+            c.execute("DELETE FROM daily   WHERE sid=?", (s,))
+            c.execute("DELETE FROM samples WHERE sid=?", (s,))
+        return len(members)
 
 
 def fetch_proxies():
@@ -280,14 +293,23 @@ def poll_once():
         ac_on = _get_setting_c(c, "autoclean", autoclean_default()) == "1"
         if proxies and STALE_AFTER_HOURS > 0 and ac_on:
             stale_cut = now - STALE_AFTER_HOURS * 3600
-            stale = [r[0] for r in c.execute(
-                "SELECT sid FROM current WHERE ts < ?", (stale_cut,)).fetchall()]
+            # Группируем `current` по name и удаляем только те группы, у которых
+            # ВСЕ члены старше порога. Хосты с альтернирующим роутингом так
+            # не задевает: пока хотя бы один sub-сервер свежий, группа жива.
+            rows = c.execute("SELECT name, sid, ts FROM current").fetchall()
+            by_name = {}
+            for nm, sid, ts in rows:
+                by_name.setdefault(nm, []).append((sid, ts))
+            stale = []
+            for nm, items in by_name.items():
+                if all(t < stale_cut for _, t in items):
+                    stale.extend(sid for sid, _ in items)
             for sid in stale:
                 c.execute("DELETE FROM current WHERE sid=?", (sid,))
                 c.execute("DELETE FROM daily   WHERE sid=?", (sid,))
                 c.execute("DELETE FROM samples WHERE sid=?", (sid,))
             if stale:
-                print("auto-cleanup: removed %d stale sid(s) older than %dh: %s"
+                print("auto-cleanup: removed %d sid(s) from fully-stale groups (>%dh): %s"
                       % (len(stale), STALE_AFTER_HOURS, stale), flush=True)
         cutoff = (datetime.now(tz()) - timedelta(days=DAYS + 1)).strftime("%Y-%m-%d")
         c.execute("DELETE FROM daily WHERE day < ?", (cutoff,))
@@ -325,57 +347,94 @@ def build_summary():
     for sid, day, up, down, lat_sum, lat_cnt, down_conf in daily_rows:
         by_sid.setdefault(sid, {})[day] = (up, down, lat_sum, lat_cnt, down_conf or 0)
 
+    # Группируем sid'ы по raw `name`. Один и тот же хост в xray-checker может
+    # быть представлен несколькими sub-серверами под общим роутингом —
+    # опрашиваются они по очереди, и поверх друг друга дают полную картину.
+    groups = {}  # name -> list[(sid, online, latency, ts, seq)]
+    for sid, name, online, latency, ts, seq in servers:
+        groups.setdefault(name, []).append((sid, online, latency, ts, seq))
+    # Порядок групп — по минимальному seq среди их членов (стабилен между опросами)
+    sorted_groups = sorted(groups.items(), key=lambda kv: min(m[4] for m in kv[1]))
+
     out_servers = []
-    tot_up = tot_total = 0
+    tot_up_cycles = 0.0
+    tot_cycles = 0.0
     tot_down_min = 0
     online_count = 0
     lat_vals = []
     last_ts = 0
 
-    for sid, name, online, latency, ts, seq in servers:
+    for name, members in sorted_groups:
         days = []
-        s_up = s_total = 0
+        s_up_cycles = 0.0
+        s_cycles = 0.0
         s_down_min = 0
         for d in day_list:
-            rec = by_sid.get(sid, {}).get(d)
-            if rec:
-                up, down, lat_sum, lat_cnt, down_conf = rec
-                total = up + down
-                pct = round(up / total * 100, 2) if total else None
-                down_min = round(down_conf * min_per_sample)
+            sum_up = sum_down = 0
+            sum_total = 0
+            n_with_data = 0
+            for sid, *_ in members:
+                rec = by_sid.get(sid, {}).get(d)
+                if rec:
+                    n_with_data += 1
+                    sum_up += rec[0]
+                    sum_down += rec[1]
+                    sum_total += rec[0] + rec[1]
+            if sum_total > 0 and n_with_data > 0:
+                # На один цикл опроса приходится N_with_data записей (по одной
+                # на каждого активного в этот день sub-сервера). cycles_d —
+                # количество реальных моментов опроса. up_cycles_d — моменты,
+                # когда хоть один член группы был up (clamp на cycles_d на случай
+                # одновременного up у нескольких членов).
+                cycles_d = sum_total / n_with_data
+                up_cycles_d = min(sum_up, cycles_d)
+                pct = round(up_cycles_d / cycles_d * 100, 2)
+                down_min_d = round((cycles_d - up_cycles_d) * min_per_sample)
+                s_up_cycles += up_cycles_d
+                s_cycles += cycles_d
+                s_down_min += down_min_d
+                has_data = True
             else:
-                total = 0
                 pct = None
-                down_min = 0
-            s_up += rec[0] if rec else 0
-            s_total += (rec[0] + rec[1]) if rec else 0
-            s_down_min += down_min
+                down_min_d = 0
+                has_data = False
             y, m, dd = d.split("-")
             label = dd + " " + RU_MONTHS[int(m)]
             days.append({"date": d, "label": label, "uptime": pct,
-                         "downMin": down_min, "hasData": total > 0})
-        up30 = round(s_up / s_total * 100, 2) if s_total else None
-        if ts and ts > last_ts:
-            last_ts = ts
-        if online:
+                         "downMin": down_min_d, "hasData": has_data})
+
+        # Текущий статус группы — по самому свежему члену (он сейчас активен в роутинге)
+        members_by_freshness = sorted(members, key=lambda x: x[3], reverse=True)
+        canon_sid, canon_online, canon_latency, canon_ts, _ = members_by_freshness[0]
+
+        up30 = round(s_up_cycles / s_cycles * 100, 2) if s_cycles else None
+        if canon_ts and canon_ts > last_ts:
+            last_ts = canon_ts
+        if canon_online:
             online_count += 1
-            if latency > 0:
-                lat_vals.append(latency)
+            if canon_latency > 0:
+                lat_vals.append(canon_latency)
         cc = detect_country(name)
         out_servers.append({
-            "sid": sid, "name": display_name(name, cc), "cc": cc,
-            "online": bool(online), "latencyMs": latency,
-            "uptime30": up30, "downMin30": s_down_min, "days": days,
+            "sid": canon_sid,
+            "name": display_name(name, cc),
+            "cc": cc,
+            "online": bool(canon_online),
+            "latencyMs": canon_latency,
+            "uptime30": up30,
+            "downMin30": s_down_min,
+            "days": days,
+            "members": len(members),
         })
-        tot_up += s_up
-        tot_total += s_total
+        tot_up_cycles += s_up_cycles
+        tot_cycles += s_cycles
         tot_down_min += s_down_min
 
     avg_lat = round(sum(lat_vals) / len(lat_vals)) if lat_vals else 0
     totals = {
         "online": online_count,
-        "total": len(servers),
-        "uptime30": round(tot_up / tot_total * 100, 2) if tot_total else None,
+        "total": len(out_servers),
+        "uptime30": round(tot_up_cycles / tot_cycles * 100, 2) if tot_cycles else None,
         "avgLatency": avg_lat,
         "downMin30": tot_down_min,
     }
@@ -394,14 +453,38 @@ def _day_payload(sid, ds, is_today):
     end = ds + 86400
     upper = int(time.time()) if is_today else end
     with _lock, conn() as c:
+        # Находим всех членов группы (одноимённые sid'ы) и тянем samples всех сразу.
+        row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
+        if row:
+            members = [r[0] for r in c.execute(
+                "SELECT sid FROM current WHERE name=?", (row[0],)).fetchall()]
+        else:
+            members = [sid]
+        placeholders = ",".join("?" * len(members))
         rows = c.execute(
-            "SELECT ts,online,latency FROM samples WHERE sid=? AND ts>=? AND ts<? ORDER BY ts",
-            (sid, ds, end)).fetchall()
-    samples = [{"ts": r[0], "online": bool(r[1]), "latency": r[2]} for r in rows]
-    pings = [r[2] for r in rows if r[1] and r[2] > 0]
+            "SELECT ts,online,latency FROM samples "
+            f"WHERE sid IN ({placeholders}) AND ts>=? AND ts<? ORDER BY ts",
+            tuple(members) + (ds, end)).fetchall()
+    # Роллап по ts: если в одну секунду опросилось несколько членов группы —
+    # «любой online → группа online», латентность = минимум среди online-членов.
+    buckets = {}
+    for ts, online, latency in rows:
+        b = buckets.get(ts)
+        if b is None:
+            buckets[ts] = [int(online), int(latency) if online else 0]
+        else:
+            if online:
+                if not b[0]:
+                    b[0] = 1
+                    b[1] = int(latency) if latency > 0 else 0
+                elif latency > 0 and (b[1] == 0 or latency < b[1]):
+                    b[1] = int(latency)
+    samples = [{"ts": ts, "online": bool(buckets[ts][0]), "latency": buckets[ts][1]}
+               for ts in sorted(buckets)]
+    pings = [s["latency"] for s in samples if s["online"] and s["latency"] > 0]
     stats = {
-        "checks": len(rows),
-        "errors": sum(1 for r in rows if not r[1]),
+        "checks": len(samples),
+        "errors": sum(1 for s in samples if not s["online"]),
         "pmin": min(pings) if pings else 0,
         "pavg": round(sum(pings) / len(pings)) if pings else 0,
         "pmax": max(pings) if pings else 0,
@@ -886,7 +969,7 @@ function buildList(data){
       var del=document.createElement("button");del.type="button";del.className="delbtn";
       del.title="Удалить сервер";del.setAttribute("aria-label","Удалить сервер");
       del.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
-      del.addEventListener("click",function(e){e.stopPropagation();deleteServer(s.sid,s.name);});
+      del.addEventListener("click",function(e){e.stopPropagation();deleteServer(s.sid,s.name,s.members);});
       row.appendChild(del);
     }
     var panel=document.createElement("div");panel.className="panel";panel.innerHTML='<div class="empty">Загрузка…</div>';
@@ -1020,8 +1103,10 @@ function toggleAutoclean(){
     .catch(function(){applyAutocleanUI(autocleanState);});
 }
 (function(){var t=document.getElementById("ac-toggle");if(t)t.addEventListener("click",toggleAutoclean);})();
-function deleteServer(sid,name){
-  if(!window.confirm('Удалить запись «'+name+'»?\n\nНакопленная статистика по ней будет удалена. Если этот сервер ещё есть в подписке xray-checker, при следующем опросе он снова появится — то есть удаление помогает в первую очередь чистить старые дубли, оставшиеся после смены конфига.'))return;
+function deleteServer(sid,name,members){
+  var n=members||1;
+  var extra=n>1?'\n\nЭто группа из '+n+' sub-серверов одного хоста (роутинг xray-checker) — будут удалены все.':'';
+  if(!window.confirm('Удалить запись «'+name+'»?'+extra+'\n\nНакопленная статистика по ней будет удалена. Если этот сервер ещё есть в подписке xray-checker, при следующем опросе он снова появится — то есть удаление помогает в первую очередь чистить старые дубли, оставшиеся после смены конфига.'))return;
   fetch("api/admin/delete",{method:"POST",
     headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
     body:JSON.stringify({sid:sid})})
