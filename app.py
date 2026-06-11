@@ -190,6 +190,29 @@ def init_db():
             ts INTEGER, sid TEXT, online INTEGER, latency INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_samples ON samples(sid, ts)")
         c.execute("DROP TABLE IF EXISTS hidden")
+        c.execute("""CREATE TABLE IF NOT EXISTS settings(
+            k TEXT PRIMARY KEY, v TEXT)""")
+
+
+def _get_setting_c(c, k, default=None):
+    row = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return row[0] if row else default
+
+
+def get_setting(k, default=None):
+    with _lock, conn() as c:
+        return _get_setting_c(c, k, default)
+
+
+def set_setting(k, v):
+    with _lock, conn() as c:
+        c.execute("INSERT INTO settings(k,v) VALUES(?,?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                  (k, str(v)))
+
+
+def autoclean_default():
+    return "1" if STALE_AFTER_HOURS > 0 else "0"
 
 
 def delete_server(sid):
@@ -250,9 +273,12 @@ def poll_once():
         # Авточистка «призраков»: записи в current, которые уже не приходят из чекера
         # (xray-checker иногда меняет stableId без явных правок конфига — обновление парсера,
         # мелкие правки на стороне подписки и т.п.; старая запись висит в БД офлайн навсегда).
-        # Чистим только если в этом опросе чекер вообще что-то отдал, чтобы не снести
-        # всё при пустом ответе из-за временной проблемы.
-        if proxies and STALE_AFTER_HOURS > 0:
+        # Условия запуска:
+        #   - чекер в этом опросе вернул хотя бы один сервер (не пустой ответ),
+        #   - порог STALE_AFTER_HOURS > 0 (мастер-выключатель через env),
+        #   - в settings включён `autoclean` (переключатель через UI админ-режима).
+        ac_on = _get_setting_c(c, "autoclean", autoclean_default()) == "1"
+        if proxies and STALE_AFTER_HOURS > 0 and ac_on:
             stale_cut = now - STALE_AFTER_HOURS * 3600
             stale = [r[0] for r in c.execute(
                 "SELECT sid FROM current WHERE ts < ?", (stale_cut,)).fetchall()]
@@ -452,6 +478,22 @@ html[data-theme="claude"] .item{border-color:#DDD8C8;}
 html[data-theme="claude"] .item:hover{border-color:#C4BDA8;}
 @keyframes pulseClaude{0%{box-shadow:0 0 0 0 rgba(95,138,86,.45);}70%{box-shadow:0 0 0 6px rgba(95,138,86,0);}100%{box-shadow:0 0 0 0 rgba(95,138,86,0);}}
 html[data-theme="claude"] .pill.ok .dot{animation:pulseClaude 2.4s ease-out infinite;}
+/* Claude Code — тёплая тёмная палитра (CLI-вайб) с copper-оранжевым акцентом */
+html[data-theme="claude-dark"]{
+  --bg:#1A1815; --card:#262320; --soft:#2D2A26; --line:#3F3933; --hover:#302C28;
+  --tx:#ECE7D9; --tx2:#B8AE9A; --tx3:#857D6C;
+  --ok:#87A571; --warn:#D9A05B; --orange:#D97757; --bad:#D77565; --info:#D97757;
+  --shadow:none;
+}
+html[data-theme="claude-dark"] body{background:radial-gradient(1400px 700px at 50% -200px,#23201C 0%,#1A1815 60%) no-repeat fixed,var(--bg);}
+html[data-theme="claude-dark"] .logo{background:rgba(217,119,87,.16);}
+html[data-theme="claude-dark"] .pill.ok{background:rgba(135,165,113,.16);color:var(--ok);}
+html[data-theme="claude-dark"] .pill.bad{background:rgba(215,117,101,.18);color:var(--bad);}
+html[data-theme="claude-dark"] #lock.lockon{background:rgba(217,119,87,.18);color:var(--info);border-color:rgba(217,119,87,.5);}
+html[data-theme="claude-dark"] .delbtn:hover{background:rgba(215,117,101,.18);color:var(--bad);border-color:var(--bad);}
+html[data-theme="claude-dark"] .actoggle::before{background:#ECE7D9;}
+@keyframes pulseClaudeDark{0%{box-shadow:0 0 0 0 rgba(135,165,113,.45);}70%{box-shadow:0 0 0 6px rgba(135,165,113,0);}100%{box-shadow:0 0 0 0 rgba(135,165,113,0);}}
+html[data-theme="claude-dark"] .pill.ok .dot{animation:pulseClaudeDark 2.4s ease-out infinite;}
 *{box-sizing:border-box}
 html{overflow-y:scroll;scrollbar-gutter:stable;}
 body{margin:0;background:var(--bg);color:var(--tx);
@@ -541,6 +583,22 @@ body{margin:0;background:var(--bg);color:var(--tx);
   margin-left:2px;transition:background .15s,color .15s,border-color .15s;}
 .delbtn:hover{background:rgba(232,80,80,.12);color:var(--bad);border-color:var(--bad);}
 #lock.lockon{background:rgba(47,107,255,.13);color:var(--info);border-color:var(--info);}
+.adminbar{display:flex;align-items:center;gap:16px;
+  background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:12px 16px;margin-bottom:18px;box-shadow:var(--shadow);
+  animation:fadeUp .34s ease both;}
+.adminlabel{flex:1;font-size:14px;color:var(--tx);min-width:0;}
+.adminlabel small{display:block;font-size:12.5px;color:var(--tx3);margin-top:2px;font-weight:400;}
+.adminlabel.aclocked small{color:var(--bad);}
+.actoggle{position:relative;width:48px;height:28px;border-radius:999px;flex:none;
+  background:var(--line);border:0;cursor:pointer;padding:0;
+  transition:background .18s ease;}
+.actoggle::before{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;
+  border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(18,28,45,.18);
+  transition:transform .22s ease;}
+.actoggle.actogon{background:var(--ok);}
+.actoggle.actogon::before{transform:translateX(20px);}
+.actoggle:disabled{opacity:.45;cursor:not-allowed;}
 @media (max-width:560px){
   .wrap{padding:22px 14px 40px;}
   .brand h1{font-size:18px;} .brand p{font-size:12px;}
@@ -576,6 +634,13 @@ body{margin:0;background:var(--bg);color:var(--tx);
     <div class="stat"><div class="l">Серверов онлайн</div><div class="v" id="s-online">—</div></div>
     <div class="stat"><div class="l">Аптайм за __DAYS__ дн</div><div class="v" id="s-uptime">—</div></div>
     <div class="stat"><div class="l">Средний пинг</div><div class="v" id="s-ping">—</div></div>
+  </div>
+  <div id="adminbar" class="adminbar" hidden>
+    <div id="adminlabel" class="adminlabel">
+      Авто-удаление устаревших записей
+      <small id="ac-sub">через <b id="ac-hours">—</b> ч после исчезновения из чекера</small>
+    </div>
+    <button id="ac-toggle" class="actoggle" type="button" aria-label="Авто-удаление"></button>
   </div>
   <div id="list"><div class="skel">Загрузка данных…</div></div>
   <div class="legend">
@@ -859,7 +924,11 @@ function render(data){
   }
 }
 function load(){
-  fetch("api/summary").then(function(r){return r.json();}).then(render)
+  fetch("api/summary").then(function(r){return r.json();}).then(function(d){
+    render(d);
+    if(adminMode)loadAdminSettings();
+    else{var ab=document.getElementById("adminbar");if(ab)ab.hidden=true;}
+  })
   .catch(function(){document.getElementById("list").innerHTML='<div class="skel">Не удалось загрузить данные</div>';});
 }
 var adminEnabled=false, adminMode=false, adminToken="";
@@ -903,8 +972,54 @@ function promptAdminToken(){
 function logoutAdmin(){
   adminToken="";adminMode=false;
   try{localStorage.removeItem("sp-admin-token");}catch(e){}
-  setLockUI();built=false;load();
+  setLockUI();var ab=document.getElementById("adminbar");if(ab)ab.hidden=true;
+  built=false;load();
 }
+var autocleanState=null, autocleanLocked=false;
+function applyAutocleanUI(state){
+  var t=document.getElementById("ac-toggle");if(!t)return;
+  if(state){t.classList.add("actogon");}else{t.classList.remove("actogon");}
+  t.setAttribute("aria-checked",state?"true":"false");
+}
+function loadAdminSettings(){
+  var ab=document.getElementById("adminbar");if(!ab)return;
+  if(!adminMode){ab.hidden=true;return;}
+  fetch("api/admin/settings",{headers:{"X-Admin-Token":adminToken}})
+    .then(function(r){if(!r.ok){if(r.status===401)logoutAdmin();throw 0;}return r.json();})
+    .then(function(s){
+      autocleanState=!!s.autoclean;
+      autocleanLocked=!!s.autocleanLocked;
+      document.getElementById("ac-hours").textContent=s.staleHours||"—";
+      var sub=document.getElementById("ac-sub");
+      var lbl=document.getElementById("adminlabel");
+      if(autocleanLocked){
+        sub.innerHTML='выключено через переменную <code>STALE_AFTER_HOURS=0</code>';
+        lbl.classList.add("aclocked");
+      }else{
+        sub.innerHTML='через <b id="ac-hours">'+s.staleHours+'</b> ч после исчезновения из чекера';
+        lbl.classList.remove("aclocked");
+      }
+      var t=document.getElementById("ac-toggle");
+      t.disabled=autocleanLocked;
+      applyAutocleanUI(autocleanState);
+      ab.hidden=false;
+    })
+    .catch(function(){});
+}
+function toggleAutoclean(){
+  if(!adminMode||autocleanLocked)return;
+  var newState=!autocleanState;
+  applyAutocleanUI(newState);
+  fetch("api/admin/settings",{method:"POST",
+    headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
+    body:JSON.stringify({autoclean:newState})})
+    .then(function(r){
+      if(r.ok){autocleanState=newState;}
+      else{applyAutocleanUI(autocleanState);if(r.status===401)logoutAdmin();}
+    })
+    .catch(function(){applyAutocleanUI(autocleanState);});
+}
+(function(){var t=document.getElementById("ac-toggle");if(t)t.addEventListener("click",toggleAutoclean);})();
 function deleteServer(sid,name){
   if(!window.confirm('Удалить запись «'+name+'»?\n\nНакопленная статистика по ней будет удалена. Если этот сервер ещё есть в подписке xray-checker, при следующем опросе он снова появится — то есть удаление помогает в первую очередь чистить старые дубли, оставшиеся после смены конфига.'))return;
   fetch("api/admin/delete",{method:"POST",
@@ -925,13 +1040,14 @@ function deleteServer(sid,name){
   var SUN='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
   var MOON='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
   var SPARK='<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 2c.4 4.5 2.6 6.7 7 7-4.4.3-6.6 2.5-7 7-.4-4.5-2.6-6.7-7-7 4.4-.3 6.6-2.5 7-7z"/></svg>';
-  var NEXT={light:"dark",dark:"claude",claude:"light"};
-  var ICON={light:MOON,dark:SPARK,claude:SUN};
-  var NAMES={light:"светлая",dark:"тёмная",claude:"Claude"};
+  var CODE='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l5-5-5-5"/><path d="M11 19h9"/></svg>';
+  var NEXT={light:"dark",dark:"claude",claude:"claude-dark","claude-dark":"light"};
+  var ICON={light:MOON,dark:SPARK,claude:CODE,"claude-dark":SUN};
+  var NAMES={light:"светлая",dark:"тёмная",claude:"Claude","claude-dark":"Claude Code"};
   var btn=document.getElementById("theme-btn");if(!btn)return;
   function cur(){
     var t=document.documentElement.getAttribute("data-theme");
-    if(t==="light"||t==="dark"||t==="claude")return t;
+    if(t==="light"||t==="dark"||t==="claude"||t==="claude-dark")return t;
     return (window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";
   }
   function setIcon(){var c=cur();btn.innerHTML=ICON[c];btn.title="Тема: "+NAMES[c]+" → "+NAMES[NEXT[c]];}
@@ -954,7 +1070,8 @@ document.addEventListener("visibilitychange",function(){if(!document.hidden)load
 _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "tyaxis", "tstats", "taxis", "phead", "sdot",
                 "overall", "pgrad",
-                "delbtn", "lockon", "lock"]
+                "delbtn", "lockon", "lock",
+                "adminbar", "adminlabel", "actoggle", "actogon", "aclocked"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
@@ -1080,6 +1197,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, blob, "font/woff2", STATIC_CACHE)
             else:
                 self._send(404, "Not Found", "text/plain; charset=utf-8")
+        elif path == "/api/admin/settings":
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            ac = get_setting("autoclean", autoclean_default()) == "1"
+            self._send(200, json.dumps({
+                "autoclean": ac,
+                "staleHours": STALE_AFTER_HOURS,
+                "autocleanLocked": STALE_AFTER_HOURS <= 0,
+            }, ensure_ascii=False), "application/json; charset=utf-8")
         elif path == "/health":
             self._send(200, "OK", "text/plain; charset=utf-8")
         else:
@@ -1113,6 +1241,18 @@ class Handler(BaseHTTPRequestHandler):
             ok = delete_server(sid)
             self._send(200,
                        json.dumps({"ok": True, "deleted": ok}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/admin/settings":
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            body = self._read_json()
+            if isinstance(body, dict) and "autoclean" in body:
+                set_setting("autoclean", "1" if body["autoclean"] else "0")
+            ac = get_setting("autoclean", autoclean_default()) == "1"
+            self._send(200, json.dumps({"ok": True, "autoclean": ac},
+                                       ensure_ascii=False),
                        "application/json; charset=utf-8")
         else:
             self._send(404, "Not Found", "text/plain; charset=utf-8")
