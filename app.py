@@ -25,6 +25,7 @@ TITLE = os.environ.get("TITLE", "Статус серверов")
 SUBTITLE = os.environ.get("SUBTITLE", "Доступность серверов в реальном времени")
 TZ_NAME = os.environ.get("TZ", "Europe/Moscow")
 SERVER_HEADER = os.environ.get("SERVER_HEADER", "nginx")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 STATIC_CACHE = "public, max-age=31536000, immutable"
 NO_CACHE = "no-cache, no-store, must-revalidate"
 
@@ -185,6 +186,48 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS samples(
             ts INTEGER, sid TEXT, online INTEGER, latency INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_samples ON samples(sid, ts)")
+        c.execute("""CREATE TABLE IF NOT EXISTS hidden(
+            sid TEXT PRIMARY KEY, name TEXT, ts INTEGER)""")
+
+
+def _hidden_sids(c):
+    return {r[0] for r in c.execute("SELECT sid FROM hidden").fetchall()}
+
+
+def list_hidden():
+    t = tz()
+    with _lock, conn() as c:
+        rows = c.execute("SELECT sid, name, ts FROM hidden ORDER BY ts DESC").fetchall()
+    return [{
+        "sid": r[0],
+        "name": r[1] or r[0],
+        "ts": r[2],
+        "hiddenAt": datetime.fromtimestamp(r[2], t).strftime("%Y-%m-%d %H:%M") if r[2] else "",
+    } for r in rows]
+
+
+def hide_server(sid):
+    if not sid:
+        return False
+    now = int(time.time())
+    with _lock, conn() as c:
+        row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
+        name = row[0] if row else sid
+        c.execute("INSERT INTO hidden(sid, name, ts) VALUES(?,?,?) "
+                  "ON CONFLICT(sid) DO UPDATE SET name=excluded.name, ts=excluded.ts",
+                  (sid, name, now))
+        c.execute("DELETE FROM current WHERE sid=?", (sid,))
+        c.execute("DELETE FROM daily WHERE sid=?", (sid,))
+        c.execute("DELETE FROM samples WHERE sid=?", (sid,))
+    return True
+
+
+def unhide_server(sid):
+    if not sid:
+        return False
+    with _lock, conn() as c:
+        cur = c.execute("DELETE FROM hidden WHERE sid=?", (sid,))
+        return cur.rowcount > 0
 
 
 def fetch_proxies():
@@ -202,9 +245,10 @@ def poll_once():
     now = int(time.time())
     today = datetime.now(tz()).strftime("%Y-%m-%d")
     with _lock, conn() as c:
+        hidden = _hidden_sids(c)
         for seq, p in enumerate(proxies):
             sid = p.get("stableId") or ""
-            if not sid:
+            if not sid or sid in hidden:
                 continue
             name = p.get("name") or sid
             online = 1 if p.get("online") else 0
@@ -329,6 +373,7 @@ def build_summary():
         "generatedAt": now_local.strftime("%Y-%m-%d %H:%M"),
         "lastCheck": last_check,
         "servers": out_servers, "totals": totals,
+        "adminEnabled": bool(ADMIN_TOKEN),
     }
 
 
@@ -487,6 +532,23 @@ body{margin:0;background:var(--bg);color:var(--tx);
 #tip .d{font-weight:600;margin-bottom:4px;}
 #tip .k{color:var(--tx2);line-height:1.5;}
 .skel{color:var(--tx2);font-size:14px;padding:30px 0;text-align:center;}
+.delbtn{display:flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
+  border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--tx3);cursor:pointer;
+  margin-left:2px;transition:background .15s,color .15s,border-color .15s;}
+.delbtn:hover{background:rgba(232,80,80,.12);color:var(--bad);border-color:var(--bad);}
+#lock.lockon{background:rgba(47,107,255,.13);color:var(--info);border-color:var(--info);}
+.hidsec{margin-top:22px;background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:14px 18px;box-shadow:var(--shadow);animation:fadeUp .34s ease both;}
+.hidsec h3{margin:0 0 4px;font-size:14px;font-weight:600;color:var(--tx2);}
+.hidsec .hidnote{font-size:12.5px;color:var(--tx3);margin-bottom:6px;}
+.hidrow{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line);font-size:14px;}
+.hidrow:first-of-type{border-top:0;}
+.hidname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.hidts{font-size:12.5px;color:var(--tx3);flex:none;}
+.hidrestore{padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);
+  color:var(--tx2);cursor:pointer;font-size:13px;font-family:inherit;flex:none;
+  transition:background .15s,color .15s,border-color .15s;}
+.hidrestore:hover{background:var(--hover);color:var(--tx);border-color:var(--tx3);}
 @media (max-width:560px){
   .wrap{padding:22px 14px 40px;}
   .brand h1{font-size:18px;} .brand p{font-size:12px;}
@@ -496,6 +558,9 @@ body{margin:0;background:var(--bg);color:var(--tx);
   .label{width:auto;flex:1 1 auto;min-width:0;}
   .stat2{width:auto;text-align:right;}
   .chev{order:4;}
+  .delbtn{order:3;}
+  .hidrow{flex-wrap:wrap;gap:6px 12px;}
+  .hidts{font-size:12px;}
   .bars{order:5;flex-basis:100%;height:26px;}
   .legend{gap:9px 14px;margin-top:14px;} .legend .right{display:none;}
   .tstats{gap:12px 22px;} .panel{padding:0 14px;}
@@ -513,6 +578,7 @@ body{margin:0;background:var(--bg);color:var(--tx);
     </div>
     <div class="topr">
       <div id="overall" class="pill ok"><span class="dot"></span><span>Загрузка…</span></div>
+      <button id="lock" class="tbtn" hidden aria-label="Админ-режим" title="Админ-режим"></button>
       <button id="theme-btn" class="tbtn" aria-label="Сменить тему" title="Сменить тему"></button>
     </div>
   </div>
@@ -761,6 +827,13 @@ function buildList(data){
     var chev=document.createElement("div");chev.className="chev";
     chev.innerHTML='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
     row.appendChild(label);row.appendChild(bars);row.appendChild(st2);row.appendChild(chev);
+    if(adminMode){
+      var del=document.createElement("button");del.type="button";del.className="delbtn";
+      del.title="Удалить сервер";del.setAttribute("aria-label","Удалить сервер");
+      del.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+      del.addEventListener("click",function(e){e.stopPropagation();deleteServer(s.sid,s.name);});
+      row.appendChild(del);
+    }
     var panel=document.createElement("div");panel.className="panel";panel.innerHTML='<div class="empty">Загрузка…</div>';
     row.addEventListener("click",function(){
       if(item.classList.contains("open")){
@@ -785,6 +858,8 @@ function sameOrder(data){
 var lastSeen=null;
 function render(data){
   updateTop(data);
+  var en=!!data.adminEnabled;
+  if(en!==adminEnabled){adminEnabled=en;setLockUI();}
   var fresh=data.lastCheck!==lastSeen;lastSeen=data.lastCheck;
   if(sameOrder(data)){
     data.servers.forEach(function(s){var item=nodes[s.sid];if(item)applyServer(item,s,data.days);});
@@ -794,9 +869,108 @@ function render(data){
   }
 }
 function load(){
-  fetch("api/summary").then(function(r){return r.json();}).then(render)
+  fetch("api/summary").then(function(r){return r.json();}).then(function(data){
+    render(data);
+    if(adminMode)loadHidden(); else removeHiddenSec();
+  })
   .catch(function(){document.getElementById("list").innerHTML='<div class="skel">Не удалось загрузить данные</div>';});
 }
+var adminEnabled=false, adminMode=false, adminToken="";
+try{adminToken=localStorage.getItem("sp-admin-token")||"";}catch(e){}
+var LOCK_CLOSED='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+var LOCK_OPEN='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>';
+function setLockUI(){
+  var b=document.getElementById("lock");if(!b)return;
+  if(!adminEnabled){b.hidden=true;return;}
+  b.hidden=false;
+  b.innerHTML=adminMode?LOCK_OPEN:LOCK_CLOSED;
+  if(adminMode){b.classList.add("lockon");b.title="Выйти из админ-режима";}
+  else{b.classList.remove("lockon");b.title="Войти в админ-режим";}
+}
+function checkAdmin(cb){
+  if(!adminToken){adminMode=false;setLockUI();if(cb)cb();return;}
+  fetch("api/admin/check",{method:"POST",headers:{"X-Admin-Token":adminToken}})
+    .then(function(r){
+      adminMode=r.ok;
+      if(!r.ok){adminToken="";try{localStorage.removeItem("sp-admin-token");}catch(e){}}
+      setLockUI();if(cb)cb();
+    })
+    .catch(function(){adminMode=false;setLockUI();if(cb)cb();});
+}
+function promptAdminToken(){
+  var t=window.prompt("Введите админ-токен:","");
+  if(t===null)return;
+  t=(t||"").trim();if(!t)return;
+  fetch("api/admin/check",{method:"POST",headers:{"X-Admin-Token":t}})
+    .then(function(r){
+      if(r.ok){
+        adminToken=t;adminMode=true;
+        try{localStorage.setItem("sp-admin-token",t);}catch(e){}
+        setLockUI();built=false;load();
+      }else{
+        window.alert("Неверный токен");
+      }
+    })
+    .catch(function(){window.alert("Не удалось проверить токен");});
+}
+function logoutAdmin(){
+  adminToken="";adminMode=false;
+  try{localStorage.removeItem("sp-admin-token");}catch(e){}
+  setLockUI();removeHiddenSec();built=false;load();
+}
+function removeHiddenSec(){var el=document.getElementById("hidsec");if(el)el.remove();}
+function deleteServer(sid,name){
+  if(!window.confirm('Удалить сервер «'+name+'» со страницы статуса?\n\nНакопленная статистика будет удалена; при следующем опросе чекер-сервер сам по себе не вернёт его на страницу — пока вы не восстановите его вручную.'))return;
+  fetch("api/admin/hide",{method:"POST",
+    headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
+    body:JSON.stringify({sid:sid})})
+    .then(function(r){
+      if(r.ok){built=false;load();}
+      else if(r.status===401){window.alert("Сессия истекла. Войдите заново.");logoutAdmin();}
+      else{window.alert("Не удалось удалить сервер");}
+    })
+    .catch(function(){window.alert("Сетевая ошибка");});
+}
+function restoreServer(sid){
+  fetch("api/admin/unhide",{method:"POST",
+    headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
+    body:JSON.stringify({sid:sid})})
+    .then(function(r){
+      if(r.ok){load();}
+      else if(r.status===401){logoutAdmin();}
+    })
+    .catch(function(){});
+}
+function loadHidden(){
+  if(!adminMode){removeHiddenSec();return;}
+  fetch("api/admin/hidden",{headers:{"X-Admin-Token":adminToken}})
+    .then(function(r){return r.ok?r.json():{hidden:[]};})
+    .then(function(data){
+      removeHiddenSec();
+      var items=(data&&data.hidden)||[];
+      if(!items.length)return;
+      var list=document.getElementById("list");if(!list)return;
+      var sec=document.createElement("div");sec.className="hidsec";sec.id="hidsec";
+      var h=document.createElement("h3");h.textContent="Скрытые сервера ("+items.length+")";
+      var note=document.createElement("div");note.className="hidnote";note.textContent="Эти сервера не отображаются на странице и не опрашиваются.";
+      sec.appendChild(h);sec.appendChild(note);
+      items.forEach(function(it){
+        var row=document.createElement("div");row.className="hidrow";
+        var nm=document.createElement("div");nm.className="hidname";nm.textContent=it.name;
+        var ts=document.createElement("div");ts.className="hidts";ts.textContent=it.hiddenAt?("скрыт "+it.hiddenAt):"";
+        var btn=document.createElement("button");btn.type="button";btn.className="hidrestore";btn.textContent="Восстановить";
+        btn.addEventListener("click",function(){restoreServer(it.sid);});
+        row.appendChild(nm);row.appendChild(ts);row.appendChild(btn);
+        sec.appendChild(row);
+      });
+      list.parentNode.insertBefore(sec,list.nextSibling);
+    })
+    .catch(function(){});
+}
+(function(){
+  var b=document.getElementById("lock");if(!b)return;
+  b.addEventListener("click",function(){adminMode?logoutAdmin():promptAdminToken();});
+})();
 (function(){
   var SUN='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
   var MOON='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
@@ -811,7 +985,7 @@ window.addEventListener("resize",function(){
   var ps=document.querySelectorAll(".item.open .panel");
   for(var i=0;i<ps.length;i++)ps[i].style.maxHeight=ps[i].scrollHeight+"px";
 });
-load();
+checkAdmin(load);
 setInterval(function(){if(!document.hidden)load();},60000);
 document.addEventListener("visibilitychange",function(){if(!document.hidden)load();});
 </script>
@@ -821,7 +995,9 @@ document.addEventListener("visibilitychange",function(){if(!document.hidden)load
 
 _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "tyaxis", "tstats", "taxis", "phead", "sdot",
-                "overall", "pgrad"]
+                "overall", "pgrad",
+                "delbtn", "hidsec", "hidrow", "hidname", "hidts",
+                "hidrestore", "hidnote", "lockon", "lock"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
@@ -852,12 +1028,40 @@ def page_html():
             .replace("__LOGO__", logo))
 
 
+def _consteq(a, b):
+    if len(a) != len(b):
+        return False
+    r = 0
+    for x, y in zip(a, b):
+        r |= ord(x) ^ ord(y)
+    return r == 0
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     def version_string(self):
         return SERVER_HEADER
+
+    def _is_admin(self):
+        if not ADMIN_TOKEN:
+            return False
+        tok = self.headers.get("X-Admin-Token", "") or ""
+        return bool(tok) and _consteq(tok, ADMIN_TOKEN)
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            n = 0
+        if n <= 0 or n > 65536:
+            return {}
+        try:
+            raw = self.rfile.read(n).decode("utf-8")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
 
     def _send(self, code, body, ctype, cache=NO_CACHE):
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -919,8 +1123,59 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, blob, "font/woff2", STATIC_CACHE)
             else:
                 self._send(404, "Not Found", "text/plain; charset=utf-8")
+        elif path == "/api/admin/hidden":
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            self._send(200,
+                       json.dumps({"hidden": list_hidden()}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
         elif path == "/health":
             self._send(200, "OK", "text/plain; charset=utf-8")
+        else:
+            self._send(404, "Not Found", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/admin/check":
+            if not ADMIN_TOKEN:
+                self._send(404, '{"error":"admin disabled"}',
+                           "application/json; charset=utf-8")
+                return
+            if self._is_admin():
+                self._send(200, '{"ok":true}',
+                           "application/json; charset=utf-8")
+            else:
+                self._send(401, '{"ok":false}',
+                           "application/json; charset=utf-8")
+        elif path == "/api/admin/hide":
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            body = self._read_json()
+            sid = (body.get("sid") if isinstance(body, dict) else None) or ""
+            if not sid:
+                self._send(400, '{"error":"sid required"}',
+                           "application/json; charset=utf-8")
+                return
+            hide_server(sid)
+            self._send(200, '{"ok":true}', "application/json; charset=utf-8")
+        elif path == "/api/admin/unhide":
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            body = self._read_json()
+            sid = (body.get("sid") if isinstance(body, dict) else None) or ""
+            if not sid:
+                self._send(400, '{"error":"sid required"}',
+                           "application/json; charset=utf-8")
+                return
+            unhide_server(sid)
+            self._send(200, '{"ok":true}', "application/json; charset=utf-8")
         else:
             self._send(404, "Not Found", "text/plain; charset=utf-8")
 
