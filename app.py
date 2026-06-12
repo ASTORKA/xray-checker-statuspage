@@ -488,7 +488,25 @@ def delete_probe(pid):
     with _lock, conn() as c:
         cur = c.execute("DELETE FROM probes WHERE probe_id=?", (pid,))
         c.execute("DELETE FROM probe_samples WHERE probe_id=?", (pid,))
+        c.execute("DELETE FROM probe_daily WHERE probe_id=?", (pid,))
+        c.execute("DELETE FROM probe_vpn_samples WHERE probe_id=?", (pid,))
         return cur.rowcount > 0
+
+
+def wipe_history():
+    """Стирает ВСЮ историю опросов: probe_samples/probe_daily/probe_vpn_samples
+    + legacy daily/samples. НЕ трогает регистрации пробников (probes) и список
+    серверов (current) — агент продолжит слать, серверы из подписки останутся,
+    шкала аптайма просто начнёт копиться заново. Нужно когда накопились
+    неактуальные данные (например, после отладки) и их надо обнулить."""
+    with _lock, conn() as c:
+        for tbl in ("probe_samples", "probe_daily", "probe_vpn_samples",
+                    "daily", "samples"):
+            try:
+                c.execute("DELETE FROM %s" % tbl)
+            except Exception as e:
+                print("wipe_history: %s — %s" % (tbl, e), flush=True)
+    return True
 
 
 def save_probe_vpn(probe_id, geo):
@@ -756,10 +774,14 @@ def build_summary():
 
     # probe_id -> {YYYY-MM-DD: total_seconds}
     vpn_by_pid_day = {}
+    # probe_id -> самый свежий ts vpn-сэмпла (для определения «сейчас VPN»).
+    latest_vpn_ts = {}
     for pid, ts_, dur in vpn_rows:
         d = datetime.fromtimestamp(ts_, t).strftime("%Y-%m-%d")
         vpn_by_pid_day.setdefault(pid, {})
         vpn_by_pid_day[pid][d] = vpn_by_pid_day[pid].get(d, 0) + int(dur or 60)
+        if ts_ > latest_vpn_ts.get(pid, 0):
+            latest_vpn_ts[pid] = ts_
 
     # (probe_id, sid) -> {ts, ok, rtt, err}
     latest_by_pid_sid = {}
@@ -846,7 +868,15 @@ def build_summary():
                     cand = latest_by_pid_sid.get((pid, sid))
                     if cand and (latest is None or cand["ts"] > latest["ts"]):
                         latest = cand
-            fresh = bool(latest and latest["ts"] >= fresh_cutoff)
+            # Самый свежий VPN-сэмпл среди всех pid этого имени.
+            vpn_ts = max((latest_vpn_ts.get(pid, 0) for pid in pids), default=0)
+            sample_ts = latest["ts"] if latest else 0
+            # «Свежесть» считаем по ЛЮБОЙ активности — обычный sample ИЛИ vpn-репорт.
+            # Устройство в VPN шлёт только vpn-репорты (без results), но оно активно.
+            last_activity = max(sample_ts, vpn_ts)
+            fresh = bool(last_activity >= fresh_cutoff)
+            # «Сейчас VPN» — свежая активность есть, и последней была vpn-отметка.
+            vpn_active = bool(fresh and vpn_ts > sample_ts)
             if s_total == 0 and latest is None and s_vpn_min == 0:
                 continue
             band = {
@@ -857,10 +887,11 @@ def build_summary():
                 "probe": probe_name,
                 "probeIds": pids,
                 "fresh": fresh,
-                "lastSeenTs": latest["ts"] if latest else 0,
-                "online": (latest["ok"] if (latest and fresh) else False),
-                "latencyMs": (latest["rtt"] if (latest and fresh and latest["ok"]) else 0),
-                "err": (latest["err"] if (latest and not latest["ok"]) else ""),
+                "vpnActive": vpn_active,
+                "lastSeenTs": max(sample_ts, vpn_ts),
+                "online": (latest["ok"] if (latest and fresh and not vpn_active) else False),
+                "latencyMs": (latest["rtt"] if (latest and fresh and not vpn_active and latest["ok"]) else 0),
+                "err": (latest["err"] if (latest and not vpn_active and not latest["ok"]) else ""),
                 "uptime30": (round(s_up / s_total * 100, 2) if s_total else None),
                 "downMin30": s_down_min,
                 "vpnMin30": s_vpn_min,
@@ -1219,9 +1250,10 @@ body{margin:0;background:var(--bg);color:var(--tx);
   font-size:12.5px;color:var(--tx2);}
 .bandName .bandPName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .bandDot{width:7px;height:7px;border-radius:50%;flex:none;}
-.bandDotOk{background:var(--ok);}
-.bandDotBad{background:var(--bad);}
-.bandDotStale{background:var(--tx3);}
+.bandDotOk{background:var(--ok);}                 /* активен, сервер онлайн — зелёный */
+.bandDotBad{background:var(--bad);}               /* активен, сервер офлайн — красный */
+.bandDotVpn{background:#969aa6;}                  /* на устройстве включён VPN — серый */
+.bandDotStale{background:#3d7bf0;}                /* устройство неактивно (не шлёт) — синий */
 .bandBars{flex:1;height:18px;min-width:0;display:block;}
 .bandBars rect{transition:fill .3s, opacity .12s;}
 .bandBars rect:hover{opacity:.55;}
@@ -1281,6 +1313,13 @@ body{margin:0;background:var(--bg);color:var(--tx);
         <small id="ac-sub">через <b id="ac-hours">—</b> ч после исчезновения из подписки</small>
       </div>
       <button id="ac-toggle" class="actoggle" type="button" aria-label="Авто-удаление"></button>
+    </div>
+    <div class="adminrow">
+      <div class="adminlabel">
+        Очистить историю опросов
+        <small>сбросить все накопленные данные пробников (графики, аптайм). Регистрации устройств и список серверов сохранятся.</small>
+      </div>
+      <button id="wipe-btn" class="delbtn" type="button" aria-label="Очистить историю" title="Очистить историю опросов" style="width:auto;padding:0 14px;gap:6px;">Очистить</button>
     </div>
   </div>
   <div id="list"><div class="skel">Загрузка данных…</div></div>
@@ -1357,13 +1396,14 @@ function renderToday(panel,data){
   var ds=data.dayStart,span=86400,W=1000;
   var chartTop=10,base=150,H=150,chartH=base-chartTop,mid=(chartTop+base)/2;
   var sw=Math.max(1.5,data.pollInterval/span*W);
-  // Серые полосы VPN — рисуются под красными полосами сбоев. Закрывают период
-  // когда на устройстве пробника был включён VPN и мы пропускали пробы.
+  // Серые полосы VPN — рисуются ПОВЕРХ красных полос сбоев. Период «на
+  // устройстве был включён VPN» важнее, чем «сбой»: мы в это время осознанно
+  // не тестили, поэтому красный сбой под VPN перекрываем серым (red → gray).
   var vpnBands="";
   (data.vpnIntervals||[]).forEach(function(iv){
     var x1=(iv.start-ds)/span*W,x2=(iv.end-ds)/span*W;
     var w=Math.max(1.5,x2-x1);
-    vpnBands+='<rect x="'+x1.toFixed(1)+'" y="0" width="'+w.toFixed(1)+'" height="'+H+'" fill="rgba(160,160,160,.20)"/>';
+    vpnBands+='<rect x="'+x1.toFixed(1)+'" y="0" width="'+w.toFixed(1)+'" height="'+H+'" fill="rgba(150,154,166,.42)"/>';
   });
   var bands="",runStart=null,runEnd=null,ptsRaw=[];
   function flush(){if(runStart!==null){bands+='<rect x="'+runStart.toFixed(1)+'" y="0" width="'+Math.max(1.5,runEnd-runStart).toFixed(1)+'" height="'+H+'" fill="rgba(232,80,80,.18)"/>';runStart=null;}}
@@ -1391,7 +1431,7 @@ function renderToday(panel,data){
   if(data.isToday){var nowX=((data.now-ds)/span*W);nowLine='<line x1="'+nowX.toFixed(1)+'" y1="0" x2="'+nowX.toFixed(1)+'" y2="'+base+'" stroke="var(--tx3)" stroke-width="1" stroke-dasharray="4 4"/>';}
   var svg='<svg viewBox="0 0 1000 '+H+'" preserveAspectRatio="none" class="tchart">'+
     '<defs><linearGradient id="pgrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2f6bff" stop-opacity="0.20"/><stop offset="1" stop-color="#2f6bff" stop-opacity="0"/></linearGradient></defs>'+
-    grid+vpnBands+area+bands+line+nowLine+
+    grid+area+bands+vpnBands+line+nowLine+
     '<line class="cursor" x1="0" y1="0" x2="0" y2="'+base+'" stroke="var(--tx2)" stroke-width="1" opacity="0"/>'+
     '</svg>';
   var zoom=2;
@@ -1581,10 +1621,12 @@ function buildBand(item,r,s){
   return b;
 }
 function updateBand(b,r){
-  // Точка статуса полосы.
-  if(!r.fresh)b._dot.className="bandDot bandDotStale";
-  else if(r.online)b._dot.className="bandDot bandDotOk";
-  else b._dot.className="bandDot bandDotBad";
+  // Точка статуса устройства: неактивно (синий) → VPN (серый) → онлайн
+  // (зелёный) → офлайн (красный).
+  if(!r.fresh)b._dot.className="bandDot bandDotStale";       // неактивно — синий
+  else if(r.vpnActive)b._dot.className="bandDot bandDotVpn";  // VPN — серый
+  else if(r.online)b._dot.className="bandDot bandDotOk";      // онлайн — зелёный
+  else b._dot.className="bandDot bandDotBad";                 // офлайн — красный
   // SVG 30-дневная шкала.
   var days=r.days||[];
   var N=days.length||1;
@@ -1642,6 +1684,8 @@ function updateBand(b,r){
   if(!r.fresh){
     var ago=Math.floor((Date.now()/1000-(r.lastSeenTs||0))/60);
     line="нет данных "+(ago>0?ago+" мин":"только что");
+  }else if(r.vpnActive){
+    line="VPN включён";     // устройство сейчас в VPN — пробы не идут
   }else if(r.online&&r.latencyMs>0){
     line=r.latencyMs+" ms";
   }else if(!r.online&&r.err){
@@ -1834,6 +1878,21 @@ function postSetting(key,toggleId,getState,setState,getLocked){
       function(){return autocleanState;},function(v){autocleanState=v;},
       function(){return autocleanLocked;});
   });
+  var wipe=document.getElementById("wipe-btn");
+  if(wipe)wipe.addEventListener("click",function(){
+    if(!adminMode)return;
+    if(!window.confirm("Стереть всю историю опросов?\n\nГрафики и 30-дневный аптайм всех серверов обнулятся. Регистрации устройств и список серверов сохранятся — данные начнут копиться заново.\n\nЭто действие необратимо."))return;
+    wipe.disabled=true;
+    fetch("api/admin/wipe-history",{method:"POST",
+      headers:{"X-Admin-Token":adminToken}})
+      .then(function(r){
+        wipe.disabled=false;
+        if(r.ok){built=false;load();window.alert("История опросов очищена.");}
+        else if(r.status===401){logoutAdmin();}
+        else{window.alert("Не удалось очистить историю");}
+      })
+      .catch(function(){wipe.disabled=false;window.alert("Сетевая ошибка");});
+  });
 })();
 function deleteServer(sid,name,members){
   var n=members||1;
@@ -1890,7 +1949,7 @@ _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "delbtn", "lockon", "lock",
                 "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked",
                 "bands", "band", "bandName", "bandPName", "bandDot",
-                "bandDotOk", "bandDotBad", "bandDotStale", "bandBars",
+                "bandDotOk", "bandDotBad", "bandDotVpn", "bandDotStale", "bandBars",
                 "bandStat", "bandPct", "bandSub", "bandErr", "emptyBands"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
@@ -2217,6 +2276,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200,
                        json.dumps({"ok": True, "deleted": ok}, ensure_ascii=False),
                        "application/json; charset=utf-8")
+        elif path == "/api/admin/wipe-history":
+            # Полная очистка истории опросов (probe_samples/daily/vpn + legacy).
+            # Регистрации пробников и список серверов сохраняются.
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            wipe_history()
+            self._send(200, '{"ok":true}', "application/json; charset=utf-8")
         elif path == "/api/admin/settings":
             if not self._is_admin():
                 self._send(401, '{"error":"unauthorized"}',
