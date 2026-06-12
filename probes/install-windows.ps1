@@ -155,9 +155,9 @@ if (-not (Test-Path $XrayPath)) {
             'Xray-windows-arm64-v8a.zip'
         } else { 'Xray-windows-64.zip' }
     } else { 'Xray-windows-32.zip' }
-    # Пинимся на v25.10.27 — последняя до 26.x с обязательным password в REALITY.
+    # Пинимся на v25.12.8 — последняя до 26.x с обязательным password в REALITY.
     # Override: $env:XRAY_VERSION="latest" перед запуском.
-    $xrayVer = if ($env:XRAY_VERSION) { $env:XRAY_VERSION } else { 'v25.10.27' }
+    $xrayVer = if ($env:XRAY_VERSION) { $env:XRAY_VERSION } else { 'v25.12.8' }
     $xrayUrl = if ($xrayVer -eq 'latest') {
         "https://github.com/XTLS/Xray-core/releases/latest/download/$arch"
     } else {

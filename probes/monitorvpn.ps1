@@ -187,7 +187,7 @@ switch ($canon) {
                 'Xray-windows-arm64-v8a.zip'
             } else { 'Xray-windows-64.zip' }
         } else { 'Xray-windows-32.zip' }
-        $xrayVer = if ($env:XRAY_VERSION) { $env:XRAY_VERSION } else { 'v25.10.27' }
+        $xrayVer = if ($env:XRAY_VERSION) { $env:XRAY_VERSION } else { 'v25.12.8' }
         $url = if ($xrayVer -eq 'latest') {
             "https://github.com/XTLS/Xray-core/releases/latest/download/$arch"
         } else {
