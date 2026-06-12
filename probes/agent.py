@@ -10,8 +10,13 @@ xray-checker-statuspage probe agent (xray-core)
      X-Probe-Token) — сервер сам парсит подписку и отдаёт разобранные
      {name, host, port, sni, uuid, security, pbk, sid, fp, flow, type, ...}.
   3. Для каждого таргета поднимает xray-core с outbound из этого таргета и
-     локальным HTTP-inbound. Через прокси дёргает http://cp.cloudflare.com/
-     cdn-cgi/trace. Если в ответе есть cloudflare-маркер «fl=» — туннель работает.
+     локальным HTTP-inbound, затем:
+       а) одиночный запрос к cp.cloudflare.com/cdn-cgi/trace — туннель жив +
+          ip отличается от прямого (не direct fallback);
+       б) BURST — PROBE_BURST_COUNT параллельных коннектов к youtube. Главный
+          тест: DPI РФ рубит REALITY-endpoint по всплеску хендшейков
+          заблокированного fingerprint. Одиночный коннект проходит даже на
+          битом конфиге, пачка — нет. Считаем долю успешных.
      После каждого теста xray-core тушится.
   4. Отправляет результаты на STATUSPAGE_URL/api/probe/report.
 
@@ -51,6 +56,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -65,24 +71,25 @@ XRAY_BIN_ENV = os.environ.get("XRAY_BIN", "").strip()
 PROBE_TEST_URL = os.environ.get("PROBE_TEST_URL",
                                 "http://cp.cloudflare.com/cdn-cgi/trace")
 PROBE_TEST_MARKER = os.environ.get("PROBE_TEST_MARKER", "fl=")
-# Этап 2: после короткого fl=-теста подгружаем главную YouTube через тот же
-# прокси. YouTube — главная цель блокировок РФ, плюс ~1MB реальной HTML/JS-
-# страницы (cloudflare-trace на 700 байт DPI просто пропускает, а полтонны
-# килобайт реального трафика — нет). Проверка считается успешной если:
-#   - получили ≥ PROBE_BULK_MIN_BYTES байт,
-#   - в первых байтах виден PROBE_BULK_MARKER (защита от случайного
-#     наполнения мусором при DPI-rewrite или fallback).
+# Этап 2 — BURST. Ключевой тест. Эмпирически подтверждено (РФ, ТСПУ): DPI рубит
+# REALITY-endpoint по ВСПЛЕСКУ хендшейков заблокированного fingerprint —
+# одиночный коннект проходит, пачка из ~30 параллельных дохнет целиком.
+# Реальный клиент (Happ) открывает десятки коннектов разом — это и воспроизводим.
+# Открываем PROBE_BURST_COUNT параллельных запросов к PROBE_BULK_URL через
+# туннель; если доля успешных < PROBE_BURST_OK_RATIO — сервер считается
+# нерабочим (DPI режет под нагрузкой / заблокированный fingerprint).
 PROBE_BULK_URL = os.environ.get("PROBE_BULK_URL", "https://www.youtube.com/")
-PROBE_BULK_MIN_BYTES = int(os.environ.get("PROBE_BULK_MIN_BYTES", "65000"))
-PROBE_BULK_MARKER = os.environ.get("PROBE_BULK_MARKER", "youtube").lower()
-# YouTube отдаёт разный контент в зависимости от UA; со старым/curl-like UA
-# может ответить «обновите браузер» (мало данных, без скриптов). Шлём
-# актуальный Chrome — чтобы получить нормальную страницу.
 PROBE_BULK_USER_AGENT = os.environ.get(
     "PROBE_BULK_USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-USER_AGENT = "xrs-probe/0.2"
+PROBE_BURST_COUNT = int(os.environ.get("PROBE_BURST_COUNT", "30"))
+PROBE_BURST_OK_RATIO = float(os.environ.get("PROBE_BURST_OK_RATIO", "0.5"))
+PROBE_BURST_TIMEOUT = float(os.environ.get("PROBE_BURST_TIMEOUT", "8"))
+# Сколько байт читать в каждом коннекте burst'а. Блок срабатывает в основном на
+# самих хендшейках, но немного реального трафика делает картину ближе к клиенту.
+PROBE_BURST_READ_BYTES = int(os.environ.get("PROBE_BURST_READ_BYTES", "65536"))
+USER_AGENT = "xrs-probe/0.3"
 
 
 def log(*a):
@@ -246,6 +253,45 @@ def _wait_port_or_exit(proc, port, timeout):
         except OSError:
             time.sleep(0.1)
     return "timeout", int((time.monotonic() - t0) * 1000)
+
+
+def _burst_through_proxy(proxy_port, n, url, ua):
+    """Открывает n параллельных соединений через HTTP-proxy на proxy_port,
+    каждое тянет url и читает до PROBE_BURST_READ_BYTES байт.
+    Возвращает (ok, n) — сколько коннектов успешно получили HTTP-ответ.
+
+    Это имитирует реальную нагрузку клиента (Happ открывает десятки коннектов
+    разом). DPI РФ рубит REALITY-endpoint по всплеску хендшейков заблокированного
+    fingerprint: одиночный коннект проходит, пачка — нет. Подтверждено:
+    chrome single ok / burst 0-из-30; firefox 30-из-30."""
+    proxy = "http://127.0.0.1:%d" % proxy_port
+    results = [False] * n
+
+    def worker(idx):
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            req = urllib.request.Request(
+                url, headers={"User-Agent": ua,
+                              "Accept": "text/html,application/xhtml+xml",
+                              "Accept-Language": "en-US,en;q=0.5"})
+            with opener.open(req, timeout=PROBE_BURST_TIMEOUT) as r:
+                got = 0
+                while got < PROBE_BURST_READ_BYTES:
+                    chunk = r.read(16384)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+            results[idx] = True
+        except Exception:
+            results[idx] = False
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=PROBE_BURST_TIMEOUT + 4)
+    return sum(1 for x in results if x), n
 
 
 def _stream_settings(t):
@@ -415,41 +461,18 @@ def xray_probe(xray_bin, t, direct_ip=""):
             if direct_ip and tunnel_ip and tunnel_ip == direct_ip:
                 return False, 0, ("туннель не использовался: ip совпадает "
                                   "с прямым (%s)" % tunnel_ip)
-            # Проверка 2: подгружаем PROBE_BULK_URL (по умолчанию youtube.com)
-            # через тот же прокси. Это и реалистичный объём (~1MB), и сам
-            # YouTube — главная цель российских блокировок. Если страница
-            # реально получена (есть маркер + не меньше PROBE_BULK_MIN_BYTES) —
-            # туннель работает по-настоящему. Если оборвалось — DPI режет.
-            try:
-                req2 = urllib.request.Request(
-                    PROBE_BULK_URL,
-                    headers={"User-Agent": PROBE_BULK_USER_AGENT,
-                             "Accept": "text/html,application/xhtml+xml",
-                             "Accept-Language": "en-US,en;q=0.5"})
-                with opener.open(req2, timeout=min(TIMEOUT, 12.0)) as r2:
-                    received = 0
-                    head_sample = b""
-                    while True:
-                        chunk = r2.read(16384)
-                        if not chunk:
-                            break
-                        received += len(chunk)
-                        if len(head_sample) < 65536:
-                            head_sample += chunk[:65536 - len(head_sample)]
-                        if received >= PROBE_BULK_MIN_BYTES * 2:
-                            break
-                if received < PROBE_BULK_MIN_BYTES:
-                    return False, 0, ("обрыв туннеля: получено %d/%d байт"
-                                      % (received, PROBE_BULK_MIN_BYTES))
-                if (PROBE_BULK_MARKER and
-                        PROBE_BULK_MARKER not in
-                        head_sample.decode("utf-8", "ignore").lower()):
-                    return False, 0, ("страница пришла, но без маркера '%s' "
-                                      "(подмена контента?)" % PROBE_BULK_MARKER)
-            except urllib.error.URLError as e:
-                return False, 0, "обрыв при bulk: " + str(e.reason)[:120]
-            except (socket.timeout, OSError) as e:
-                return False, 0, "обрыв при bulk: " + type(e).__name__
+            # Проверка 2 (BURST): открываем PROBE_BURST_COUNT параллельных
+            # соединений к PROBE_BULK_URL через туннель. Это и есть главный
+            # тест — одиночный коннект проходит даже на заблокированном
+            # fingerprint, а пачка хендшейков триггерит DPI-блок endpoint'а.
+            # Реальный клиент (Happ) открывает десятки коннектов разом.
+            ok_n, total_n = _burst_through_proxy(
+                port, PROBE_BURST_COUNT, PROBE_BULK_URL, PROBE_BULK_USER_AGENT)
+            ratio = (ok_n / total_n) if total_n else 0.0
+            if ratio < PROBE_BURST_OK_RATIO:
+                return False, 0, ("DPI режет под нагрузкой: прошло %d/%d "
+                                  "параллельных коннектов (заблокированный "
+                                  "fingerprint?)" % (ok_n, total_n))
             return True, rtt, ""
         except urllib.error.URLError as e:
             # Туннель не открылся — внутри xray может быть лог почему.
