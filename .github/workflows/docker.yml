@@ -20,4 +20,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/astorka/xray-checker-statuspage:latest
+          tags: ghcr.io/mrvibecodic/xray-checker-statuspage:latest

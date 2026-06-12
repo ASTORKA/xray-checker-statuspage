@@ -453,7 +453,7 @@ docker exec statuspage env | grep PROBE        # проверить env
 ```bash
 # Установка
 mkdir -p ~/xrs-probe && cd ~/xrs-probe
-curl -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-macos.sh -o install-macos.sh
+curl -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-macos.sh -o install-macos.sh
 bash install-macos.sh
 # спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
 
@@ -476,7 +476,7 @@ monitorvpn delete      # полностью удалить
 ```powershell
 # Установка (нужен Python 3.10+, ставится через `winget install Python.Python.3.12`)
 mkdir ~\xrs-probe; cd ~\xrs-probe
-curl.exe -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
+curl.exe -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
 .\install-windows.ps1
 
 # Управление (после установки команда `monitorvpn` появится в PATH; перезайди

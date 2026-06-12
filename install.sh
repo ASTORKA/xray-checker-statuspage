@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/ASTORKA/xray-checker-statuspage.git"
+REPO_URL="https://github.com/Mrvibecodic/xray-checker-statuspage.git"
 # Ветка, с которой ensure_source синкает ./src. По умолчанию main, но если
 # install.sh запущен ИЗ git-клона на другой ветке — берём ту же ветку, чтобы
 # не возникало рассинхрона «верх репо на feat, а src сидит на main».

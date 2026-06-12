@@ -1,6 +1,6 @@
 services:
   statuspage:
-    image: ghcr.io/astorka/xray-checker-statuspage:latest
+    image: ghcr.io/mrvibecodic/xray-checker-statuspage:latest
     container_name: statuspage
     restart: unless-stopped
     environment:

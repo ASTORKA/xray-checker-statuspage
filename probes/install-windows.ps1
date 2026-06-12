@@ -48,8 +48,8 @@ $TaskName  = 'XrayCheckerProbe'
 $AppDir    = Join-Path $env:USERPROFILE '.xrs-probe'
 $LogFile   = Join-Path $AppDir 'agent.log'
 $LocalBin  = Join-Path $env:USERPROFILE '.local\bin'
-$AgentRaw  = 'https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/agent.py'
-$MonitorRaw = 'https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/monitorvpn.ps1'
+$AgentRaw  = 'https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/agent.py'
+$MonitorRaw = 'https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/monitorvpn.ps1'
 
 function Write-G ([string]$msg) { Write-Host $msg -ForegroundColor Green }
 function Write-Y ([string]$msg) { Write-Host $msg -ForegroundColor Yellow }

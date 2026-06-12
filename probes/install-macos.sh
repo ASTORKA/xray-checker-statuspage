@@ -17,7 +17,7 @@ APP_DIR="${HOME}/.xrs-probe"
 LOG_FILE="${HOME}/Library/Logs/xrs-probe.log"
 PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 PYTHON="/usr/bin/python3"
-AGENT_RAW_URL="https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/agent.py"
+AGENT_RAW_URL="https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/agent.py"
 
 c_g(){ printf "\033[32m%s\033[0m\n" "$*"; }
 c_y(){ printf "\033[33m%s\033[0m\n" "$*"; }
@@ -80,7 +80,7 @@ mkdir -p "${APP_DIR}"
 mkdir -p "$(dirname "${LOG_FILE}")"
 mkdir -p "$(dirname "${PLIST}")"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-MONITORVPN_RAW_URL="https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/monitorvpn"
+MONITORVPN_RAW_URL="https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/monitorvpn"
 if [ -f "${SELF_DIR}/agent.py" ]; then
   cp "${SELF_DIR}/agent.py" "${APP_DIR}/agent.py"
   echo "  agent.py скопирован из ${SELF_DIR}"
