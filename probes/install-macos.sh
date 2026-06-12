@@ -32,6 +32,10 @@ uninstall(){
   launchctl unload "${PLIST}" 2>/dev/null || true
   rm -f "${PLIST}"
   rm -rf "${APP_DIR}"
+  if [ -L /usr/local/bin/monitorvpn ]; then
+    rm -f /usr/local/bin/monitorvpn 2>/dev/null \
+      || c_y "не могу удалить /usr/local/bin/monitorvpn без sudo (sudo rm -f /usr/local/bin/monitorvpn)"
+  fi
   c_g "✓ удалено. Логи остались в ${LOG_FILE} (можешь удалить вручную)."
   exit 0
 }
@@ -76,6 +80,7 @@ mkdir -p "${APP_DIR}"
 mkdir -p "$(dirname "${LOG_FILE}")"
 mkdir -p "$(dirname "${PLIST}")"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+MONITORVPN_RAW_URL="https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/monitorvpn"
 if [ -f "${SELF_DIR}/agent.py" ]; then
   cp "${SELF_DIR}/agent.py" "${APP_DIR}/agent.py"
   echo "  agent.py скопирован из ${SELF_DIR}"
@@ -85,6 +90,32 @@ else
   echo "  agent.py скачан с GitHub"
 fi
 chmod 600 "${APP_DIR}/agent.py"
+
+if [ -f "${SELF_DIR}/monitorvpn" ]; then
+  cp "${SELF_DIR}/monitorvpn" "${APP_DIR}/monitorvpn"
+else
+  curl -fsSL "${MONITORVPN_RAW_URL}" -o "${APP_DIR}/monitorvpn" \
+    || c_y "не удалось скачать monitorvpn с GitHub (необязательно)"
+fi
+chmod +x "${APP_DIR}/monitorvpn" 2>/dev/null || true
+
+# Положим symlink в /usr/local/bin, если есть права. Иначе подскажем как.
+if [ -w /usr/local/bin ] 2>/dev/null; then
+  ln -sf "${APP_DIR}/monitorvpn" /usr/local/bin/monitorvpn
+  echo "  команда monitorvpn доступна глобально (/usr/local/bin/monitorvpn)"
+elif command -v sudo >/dev/null 2>&1; then
+  if sudo -n true 2>/dev/null; then
+    sudo ln -sf "${APP_DIR}/monitorvpn" /usr/local/bin/monitorvpn
+    echo "  команда monitorvpn доступна глобально (через sudo)"
+  else
+    c_y "→ чтобы вызывать команду как 'monitorvpn', выполни один раз:"
+    echo "    sudo ln -sf ${APP_DIR}/monitorvpn /usr/local/bin/monitorvpn"
+    echo "  пока можно запускать через полный путь: ${APP_DIR}/monitorvpn status"
+  fi
+else
+  c_y "→ symlink в PATH не создан. Запускай через полный путь:"
+  echo "    ${APP_DIR}/monitorvpn status"
+fi
 
 c_g "→ регистрируем LaunchAgent ${LABEL}…"
 cat > "${PLIST}" <<EOF
@@ -129,7 +160,8 @@ fi
 
 echo
 c_g "✓ агент запущен. При следующих логинах будет стартовать сам."
-echo "   Логи:    tail -f \"${LOG_FILE}\""
-echo "   Снести:  bash \"$0\" --uninstall"
+echo "   Управление:  monitorvpn {start|stop|restart|status|logs|delete}"
+echo "   Логи:        tail -f \"${LOG_FILE}\""
+echo "   Снести:      monitorvpn delete   (или: bash \"$0\" --uninstall)"
 echo
 c_y "Подсказка: первая строка лога должна быть «start: interval=...» через ~5 сек."

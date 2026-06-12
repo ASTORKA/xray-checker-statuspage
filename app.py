@@ -215,6 +215,17 @@ def init_db():
             ok INTEGER, rtt INTEGER, err TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_probe_sid_ts ON probe_samples(sid, ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_probe_pid_ts ON probe_samples(probe_id, ts)")
+        # Дневные агрегаты по пробникам — для 30-дневной шкалы аптайма у каждой
+        # полосы пробника. up/down — счётчики, lat_sum/lat_cnt — для среднего пинга,
+        # down_conf — «подтверждённые» простои (2 подряд офлайн = 1 интервал).
+        c.execute("""CREATE TABLE IF NOT EXISTS probe_daily(
+            day TEXT, probe_id TEXT, sid TEXT,
+            up INTEGER DEFAULT 0, down INTEGER DEFAULT 0,
+            lat_sum INTEGER DEFAULT 0, lat_cnt INTEGER DEFAULT 0,
+            down_conf INTEGER DEFAULT 0,
+            PRIMARY KEY(day, probe_id, sid))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_probe_daily_sid ON probe_daily(sid, day)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_probe_daily_pid ON probe_daily(probe_id, day)")
 
 
 def _get_setting_c(c, k, default=None):
@@ -241,9 +252,13 @@ def autoclean_default():
 # ---- Региональные пробники ------------------------------------------------------
 
 # За какое окно (мин) считаем sample пробника «свежим» для статуса на странице.
-# Старее этого — UI рисует серую точку «нет связи».
+# Старее этого — UI рисует серую заглушку «нет данных» (но не убирает строку,
+# чтобы старый аптайм оставался виден).
 PROBE_FRESH_MINUTES = int(os.environ.get("PROBE_FRESH_MINUTES", "10"))
-PROBE_SAMPLE_RETAIN_HOURS = int(os.environ.get("PROBE_SAMPLE_RETAIN_HOURS", "72"))
+# По умолчанию храним probe-samples под ширину 30-дневной шкалы (+1 на стык),
+# чтобы график пинга работал для любого дня из шкалы аптайма.
+PROBE_SAMPLE_RETAIN_HOURS = int(os.environ.get(
+    "PROBE_SAMPLE_RETAIN_HOURS", str((DAYS + 1) * 24)))
 # URL подписки для пробников. Если задан, сервер сам тянет/парсит её и отдаёт
 # пробникам разобранный список таргетов через /api/probe/targets — пробник
 # больше не лезет в подписку напрямую. Это нужно когда подписка доступна
@@ -437,16 +452,46 @@ def save_probe_report(probe_id, geo, results):
                     if rtt > 0 and (cur["rtt"] == 0 or rtt < cur["rtt"]):
                         cur["rtt"] = rtt
                 # if not ok — оставляем как есть; либо там уже ok, либо тоже не ok
+        today = datetime.now(tz()).strftime("%Y-%m-%d")
         for sid, m in merged.items():
+            ok = 1 if m["ok"] else 0
+            rtt = m["rtt"]
+            # down_conf: «подтверждённый» простой — 1, если этот результат офлайн
+            # И прошлый sample того же probe×sid тоже офлайн (и был недавно).
+            # Так одиночный блип не считается за интервал простоя.
+            down_conf = 0
+            if not ok:
+                prev = c.execute(
+                    "SELECT ok, ts FROM probe_samples "
+                    "WHERE probe_id=? AND sid=? ORDER BY ts DESC LIMIT 1",
+                    (probe_id, sid)).fetchone()
+                if prev and prev[0] == 0 and prev[1] is not None:
+                    # Если интервал между этим и прошлым sample разумный
+                    # (не больше 2× окна свежести) — считаем подтверждённым.
+                    if (now - prev[1]) <= PROBE_FRESH_MINUTES * 60 * 2:
+                        down_conf = 1
             c.execute(
                 "INSERT INTO probe_samples(ts, probe_id, sid, ok, rtt, err) "
                 "VALUES(?,?,?,?,?,?)",
-                (now, probe_id, sid, 1 if m["ok"] else 0, m["rtt"], m["err"]))
+                (now, probe_id, sid, ok, rtt, m["err"]))
+            lat_sum = rtt if (ok and rtt > 0) else 0
+            lat_cnt = 1 if (ok and rtt > 0) else 0
+            c.execute(
+                "INSERT INTO probe_daily(day, probe_id, sid, up, down, "
+                "lat_sum, lat_cnt, down_conf) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(day, probe_id, sid) DO UPDATE SET "
+                "  up=up+excluded.up, down=down+excluded.down, "
+                "  lat_sum=lat_sum+excluded.lat_sum, lat_cnt=lat_cnt+excluded.lat_cnt, "
+                "  down_conf=down_conf+excluded.down_conf",
+                (today, probe_id, sid, ok, 1 - ok, lat_sum, lat_cnt, down_conf))
             saved += 1
         c.execute("UPDATE probes SET last_seen=?, last_geo=? WHERE probe_id=?",
                   (now, (geo or "")[:8], probe_id))
         c.execute("DELETE FROM probe_samples WHERE ts < ?",
                   (now - PROBE_SAMPLE_RETAIN_HOURS * 3600,))
+        # Чистка daily-агрегатов старше окна шкалы (DAYS+1)
+        cutoff_day = (datetime.now(tz()) - timedelta(days=DAYS + 1)).strftime("%Y-%m-%d")
+        c.execute("DELETE FROM probe_daily WHERE day < ?", (cutoff_day,))
     return saved
 
 
@@ -589,57 +634,62 @@ def poller():
 
 
 def build_summary():
+    """В НОВОЙ модели данные о работоспособности берутся ТОЛЬКО от пробников.
+    xray-checker остаётся только источником списка серверов (имена, флаги, группы).
+
+    На каждый сервер у нас N полос — по одной на каждого зарегистрированного
+    пробника. У каждой своя 30-дневная шкала аптайма (из probe_daily), свой
+    текущий пинг и последний sample. Если за последние PROBE_FRESH_MINUTES от
+    пробника ничего не пришло — полоса остаётся, но помечается как stale
+    («нет данных N мин»), последние сэмплы остаются видны."""
     t = tz()
+    now = int(time.time())
     now_local = datetime.now(t)
     day_list = [(now_local - timedelta(days=i)).strftime("%Y-%m-%d")
                 for i in range(DAYS - 1, -1, -1)]
-    min_per_sample = POLL_INTERVAL / 60.0
+    fresh_cutoff = now - PROBE_FRESH_MINUTES * 60
 
     with _lock, conn() as c:
         servers = c.execute(
             "SELECT sid,name,online,latency,ts,seq FROM current ORDER BY seq").fetchall()
+        # Все зарегистрированные пробники — даже без свежих данных.
+        probes_meta = c.execute(
+            "SELECT probe_id, name, last_seen, last_geo, created_at "
+            "FROM probes ORDER BY created_at").fetchall()
+        # Дневные агрегаты по пробникам, для построения 30-дневной шкалы.
         daily_rows = c.execute(
-            "SELECT sid,day,up,down,lat_sum,lat_cnt,down_conf FROM daily").fetchall()
-        # Свежие пробы от региональных пробников: за последние PROBE_FRESH_MINUTES.
-        # Для каждой пары (sid, probe_id) берём самый свежий sample.
-        probe_cutoff = int(time.time()) - PROBE_FRESH_MINUTES * 60
-        probe_rows = c.execute(
-            "SELECT ts, probe_id, sid, ok, rtt, err FROM probe_samples WHERE ts >= ?",
-            (probe_cutoff,)).fetchall()
-        probe_names = dict(c.execute(
-            "SELECT probe_id, name FROM probes").fetchall())
+            "SELECT probe_id, sid, day, up, down, lat_sum, lat_cnt, down_conf "
+            "FROM probe_daily").fetchall()
+        # Самый свежий sample на каждую пару (probe_id, sid) — для статуса/пинга.
+        latest_rows = c.execute(
+            "SELECT probe_id, sid, ts, ok, rtt, err FROM probe_samples "
+            "WHERE ts >= ? - ? ",
+            (now, PROBE_SAMPLE_RETAIN_HOURS * 3600)).fetchall()
 
-    by_sid = {}
-    for sid, day, up, down, lat_sum, lat_cnt, down_conf in daily_rows:
-        by_sid.setdefault(sid, {})[day] = (up, down, lat_sum, lat_cnt, down_conf or 0)
+    # probe_id -> {name, ...}
+    probe_info = {pid: {"name": nm or pid, "lastSeen": ls or 0,
+                       "lastGeo": geo or "", "createdAt": ca or 0}
+                  for pid, nm, ls, geo, ca in probes_meta}
 
-    latest_probe = {}  # (sid, probe_id) -> (ts, ok, rtt, err)
-    for ts, pid, sid, ok, rtt, err in probe_rows:
-        key = (sid, pid)
-        cur = latest_probe.get(key)
-        if cur is None or ts > cur[0]:
-            latest_probe[key] = (ts, ok, rtt, err)
-    probes_by_sid = {}
-    for (sid, pid), (ts, ok, rtt, err) in latest_probe.items():
-        probes_by_sid.setdefault(sid, []).append({
-            "probe_id": pid,
-            "name": probe_names.get(pid, pid),
-            "ok": bool(ok),
-            "rtt": int(rtt or 0),
-            "err": err or "",
-            "ts": ts,
-        })
-    # Сортируем по имени, чтобы маркеры были стабильны между обновлениями.
-    for arr in probes_by_sid.values():
-        arr.sort(key=lambda x: x["name"])
+    # (probe_id, sid) -> {day: (up, down, lat_sum, lat_cnt, down_conf)}
+    daily_by_pid_sid = {}
+    for pid, sid, day, up, down, ls_, lc_, dc_ in daily_rows:
+        daily_by_pid_sid.setdefault((pid, sid), {})[day] = (
+            up, down, ls_, lc_, dc_ or 0)
 
-    # Группируем sid'ы по raw `name`. Один и тот же хост в xray-checker может
-    # быть представлен несколькими sub-серверами под общим роутингом —
-    # опрашиваются они по очереди, и поверх друг друга дают полную картину.
-    groups = {}  # name -> list[(sid, online, latency, ts, seq)]
-    for sid, name, online, latency, ts, seq in servers:
-        groups.setdefault(name, []).append((sid, online, latency, ts, seq))
-    # Порядок групп — по минимальному seq среди их членов (стабилен между опросами)
+    # (probe_id, sid) -> {ts, ok, rtt, err}
+    latest_by_pid_sid = {}
+    for pid, sid, ts_, ok, rtt, err in latest_rows:
+        key = (pid, sid)
+        cur = latest_by_pid_sid.get(key)
+        if cur is None or ts_ > cur["ts"]:
+            latest_by_pid_sid[key] = {"ts": ts_, "ok": bool(ok),
+                                      "rtt": int(rtt or 0), "err": err or ""}
+
+    # Группируем sid'ы по raw `name` (то же, что и было).
+    groups = {}
+    for sid, name, online, latency, ts_, seq in servers:
+        groups.setdefault(name, []).append((sid, online, latency, ts_, seq))
     sorted_groups = sorted(groups.items(), key=lambda kv: min(m[4] for m in kv[1]))
 
     out_servers = []
@@ -648,87 +698,109 @@ def build_summary():
     tot_down_min = 0
     online_count = 0
     lat_vals = []
-    last_ts = 0
+    poll_interval_min = max(POLL_INTERVAL / 60.0, 0.1)
 
     for name, members in sorted_groups:
-        days = []
-        s_up = 0
-        s_total = 0
-        s_down_min = 0
-        for d in day_list:
-            # «Наложение графиков»: складываем проверки всех членов группы за день.
-            # Доля аптайма = успешные проверки / все проверки — это корректно и для
-            # чередующихся sid (пока активен один, второй молчит), и для одновременно
-            # опрашиваемых (xray-checker опрашивает всех каждый цикл). Никаких min()/
-            # cap — иначе реальные сбои маскируются, а у 2-членной группы аптайм
-            # удваивается (что и давало ложные 100% и одинаковые значения у всех).
-            sum_up = sum_total = 0
-            sum_down_conf = 0
-            n_with_data = 0
-            for sid, *_ in members:
-                rec = by_sid.get(sid, {}).get(d)
-                if rec:
-                    n_with_data += 1
-                    sum_up += rec[0]
-                    sum_total += rec[0] + rec[1]
-                    sum_down_conf += rec[4]
-            if sum_total > 0:
-                pct = round(sum_up / sum_total * 100, 2)
-                # Минуты простоя: confirmed-down проверки → минуты. Делим на число
-                # активных в этот день членов, чтобы при одновременном опросе не
-                # удваивать (для n=1 совпадает со старой формулой).
-                down_min_d = round(sum_down_conf / n_with_data * min_per_sample)
-                s_up += sum_up
-                s_total += sum_total
-                s_down_min += down_min_d
-                has_data = True
-            else:
-                pct = None
-                down_min_d = 0
-                has_data = False
-            y, m, dd = d.split("-")
-            label = dd + " " + RU_MONTHS[int(m)]
-            days.append({"date": d, "label": label, "uptime": pct,
-                         "downMin": down_min_d, "hasData": has_data})
-
-        # Текущий статус группы — по самому свежему члену (он сейчас активен в роутинге)
-        members_by_freshness = sorted(members, key=lambda x: x[3], reverse=True)
-        canon_sid, canon_online, canon_latency, canon_ts, _ = members_by_freshness[0]
-
-        up30 = round(s_up / s_total * 100, 2) if s_total else None
-        if canon_ts and canon_ts > last_ts:
-            last_ts = canon_ts
-        if canon_online:
-            online_count += 1
-            if canon_latency > 0:
-                lat_vals.append(canon_latency)
+        member_sids = [m[0] for m in members]
+        canon_sid = sorted(members, key=lambda x: x[4])[0][0]
         cc = detect_country(name)
-        # Пробы — собираем со ВСЕХ членов группы, а не только canonical, потому что
-        # при чередовании sid пробник мог за окно репортить несколько (для разных sid
-        # одного хоста). Из каждой пары (probe_id, sid) уже выбран самый свежий выше;
-        # тут ещё раз свернём по probe_id: оставляем самую свежую запись по хосту.
-        gp = {}
-        for m in members:
-            for pr in probes_by_sid.get(m[0], []):
-                cur = gp.get(pr["probe_id"])
-                if cur is None or pr["ts"] > cur["ts"]:
-                    gp[pr["probe_id"]] = pr
-        probes_arr = sorted(gp.values(), key=lambda x: x["name"])
+
+        # Для каждого зарегистрированного пробника строим полосу.
+        regional = []
+        for pid, pinfo in probe_info.items():
+            # Дневные агрегаты этого пробника по всем sid группы.
+            days = []
+            s_up = 0
+            s_total = 0
+            s_down_min = 0
+            for d in day_list:
+                sum_up = sum_total = sum_dc = 0
+                n_with_data = 0
+                for sid in member_sids:
+                    rec = daily_by_pid_sid.get((pid, sid), {}).get(d)
+                    if rec:
+                        n_with_data += 1
+                        sum_up += rec[0]
+                        sum_total += rec[0] + rec[1]
+                        sum_dc += rec[4]
+                if sum_total > 0:
+                    pct = round(sum_up / sum_total * 100, 2)
+                    down_min_d = round(sum_dc / max(n_with_data, 1) * poll_interval_min)
+                    s_up += sum_up
+                    s_total += sum_total
+                    s_down_min += down_min_d
+                    has_data = True
+                else:
+                    pct = None
+                    down_min_d = 0
+                    has_data = False
+                y, m, dd = d.split("-")
+                label = dd + " " + RU_MONTHS[int(m)]
+                days.append({"date": d, "label": label, "uptime": pct,
+                             "downMin": down_min_d, "hasData": has_data})
+            # Самый свежий sample по этой группе для этого пробника.
+            latest = None
+            for sid in member_sids:
+                cand = latest_by_pid_sid.get((pid, sid))
+                if cand and (latest is None or cand["ts"] > latest["ts"]):
+                    latest = cand
+            # Свежий = от пробника пришло что-то за окно «свежести» по любому sid.
+            fresh = bool(latest and latest["ts"] >= fresh_cutoff)
+            # Пропускаем полосу, если у этого пробника вообще нет НИКАКИХ данных
+            # по этой группе (ни дневных, ни sample) — нечего показывать.
+            if s_total == 0 and latest is None:
+                continue
+            band = {
+                "probe_id": pid,
+                "probe": pinfo["name"],
+                "fresh": fresh,
+                "lastSeenTs": latest["ts"] if latest else 0,
+                "online": (latest["ok"] if (latest and fresh) else False),
+                "latencyMs": (latest["rtt"] if (latest and fresh and latest["ok"]) else 0),
+                "err": (latest["err"] if (latest and not latest["ok"]) else ""),
+                "uptime30": (round(s_up / s_total * 100, 2) if s_total else None),
+                "downMin30": s_down_min,
+                "days": days,
+            }
+            regional.append(band)
+            # Тоталы: одна группа = одно «онлайн», если хотя бы один свежий пробник видит её.
+            # Считаем только один раз на группу (через флаг ниже).
+
+        # Текущий статус группы для тоталов и для верхнего кружка-точки.
+        any_fresh_online = any(b["fresh"] and b["online"] for b in regional)
+        any_fresh = any(b["fresh"] for b in regional)
+        # Текущий пинг (для лимита на странице) — берём минимальный среди свежих ok.
+        cur_rtts = [b["latencyMs"] for b in regional
+                    if b["fresh"] and b["online"] and b["latencyMs"] > 0]
+        cur_latency = min(cur_rtts) if cur_rtts else 0
+        # 30-дневный аптайм группы = усреднение по каждому пробнику * его весу
+        # (по простому: средний uptime30 у пробников у которых он не None).
+        upts = [b["uptime30"] for b in regional if b["uptime30"] is not None]
+        up30 = round(sum(upts) / len(upts), 2) if upts else None
+
+        if any_fresh_online:
+            online_count += 1
+            if cur_latency > 0:
+                lat_vals.append(cur_latency)
+
+        sum_dm = sum(b["downMin30"] for b in regional)
+        sum_up_all = sum(b["uptime30"] for b in regional if b["uptime30"] is not None)
         out_servers.append({
             "sid": canon_sid,
             "name": display_name(name, cc),
             "cc": cc,
-            "online": bool(canon_online),
-            "latencyMs": canon_latency,
+            "online": bool(any_fresh_online),
+            "anyFresh": bool(any_fresh),
+            "latencyMs": cur_latency,
             "uptime30": up30,
-            "downMin30": s_down_min,
-            "days": days,
+            "downMin30": sum_dm,
             "members": len(members),
-            "probes": probes_arr,
+            "regional": regional,
+            "noData": len(regional) == 0,
         })
-        tot_up += s_up
-        tot_total += s_total
-        tot_down_min += s_down_min
+        tot_up += sum_up_all
+        tot_total += len(upts) * 100  # каждое uptime30 — это «100%-сегмент»
+        tot_down_min += sum_dm
 
     avg_lat = round(sum(lat_vals) / len(lat_vals)) if lat_vals else 0
     totals = {
@@ -737,50 +809,61 @@ def build_summary():
         "uptime30": round(tot_up / tot_total * 100, 2) if tot_total else None,
         "avgLatency": avg_lat,
         "downMin30": tot_down_min,
+        "probes": len(probe_info),
     }
-    last_check = datetime.fromtimestamp(last_ts, t).strftime("%Y-%m-%d %H:%M") if last_ts else None
+    # «Последняя проверка» = максимум lastSeen среди всех пробников.
+    last_ts = max((p["lastSeen"] for p in probe_info.values()), default=0)
+    last_check = (datetime.fromtimestamp(last_ts, t).strftime("%Y-%m-%d %H:%M")
+                  if last_ts else None)
     return {
         "title": TITLE, "subtitle": SUBTITLE, "days": DAYS,
         "pollInterval": POLL_INTERVAL,
+        "freshMinutes": PROBE_FRESH_MINUTES,
         "generatedAt": now_local.strftime("%Y-%m-%d %H:%M"),
         "lastCheck": last_check,
         "servers": out_servers, "totals": totals,
         "adminEnabled": bool(ADMIN_TOKEN),
+        "probeMode": True,
     }
 
 
-def _day_payload(sid, ds, is_today):
+def _day_payload(sid, ds, is_today, probe_id=None):
+    """Сэмплы за конкретный день. В новой модели ТОЛЬКО от пробников: probe_id —
+    обязательно. Без probe_id — пустой результат (UI должен передавать).
+    Для совместимости вызов без probe_id возвращает пустые samples."""
     end = ds + 86400
     upper = int(time.time()) if is_today else end
-    with _lock, conn() as c:
-        # Находим всех членов группы (одноимённые sid'ы) и тянем samples всех сразу.
-        row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
-        if row:
-            members = [r[0] for r in c.execute(
-                "SELECT sid FROM current WHERE name=?", (row[0],)).fetchall()]
-        else:
-            members = [sid]
-        placeholders = ",".join("?" * len(members))
-        rows = c.execute(
-            "SELECT ts,online,latency FROM samples "
-            f"WHERE sid IN ({placeholders}) AND ts>=? AND ts<? ORDER BY ts",
-            tuple(members) + (ds, end)).fetchall()
-    # Роллап по ts: если в одну секунду опросилось несколько членов группы —
-    # «любой online → группа online», латентность = минимум среди online-членов.
-    buckets = {}
-    for ts, online, latency in rows:
-        b = buckets.get(ts)
-        if b is None:
-            buckets[ts] = [int(online), int(latency) if online else 0]
-        else:
-            if online:
-                if not b[0]:
-                    b[0] = 1
-                    b[1] = int(latency) if latency > 0 else 0
-                elif latency > 0 and (b[1] == 0 or latency < b[1]):
-                    b[1] = int(latency)
-    samples = [{"ts": ts, "online": bool(buckets[ts][0]), "latency": buckets[ts][1]}
-               for ts in sorted(buckets)]
+    samples = []
+    if probe_id:
+        with _lock, conn() as c:
+            row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
+            if row:
+                members = [r[0] for r in c.execute(
+                    "SELECT sid FROM current WHERE name=?", (row[0],)).fetchall()]
+            else:
+                members = [sid]
+            placeholders = ",".join("?" * len(members))
+            rows = c.execute(
+                "SELECT ts, ok, rtt FROM probe_samples "
+                f"WHERE probe_id=? AND sid IN ({placeholders}) "
+                "AND ts>=? AND ts<? ORDER BY ts",
+                (probe_id,) + tuple(members) + (ds, end)).fetchall()
+        # Роллап по ts.
+        buckets = {}
+        for ts, ok, rtt in rows:
+            b = buckets.get(ts)
+            if b is None:
+                buckets[ts] = [int(ok), int(rtt) if ok else 0]
+            else:
+                if ok:
+                    if not b[0]:
+                        b[0] = 1
+                        b[1] = int(rtt) if rtt > 0 else 0
+                    elif rtt > 0 and (b[1] == 0 or rtt < b[1]):
+                        b[1] = int(rtt)
+        samples = [{"ts": ts, "online": bool(buckets[ts][0]),
+                    "latency": buckets[ts][1]}
+                   for ts in sorted(buckets)]
     pings = [s["latency"] for s in samples if s["online"] and s["latency"] > 0]
     stats = {
         "checks": len(samples),
@@ -792,7 +875,8 @@ def _day_payload(sid, ds, is_today):
     dt = datetime.fromtimestamp(ds, tz())
     label = "Сегодня" if is_today else (dt.strftime("%d ") + RU_MONTHS[dt.month])
     return {"dayStart": ds, "now": upper, "isToday": is_today, "dayLabel": label,
-            "pollInterval": POLL_INTERVAL, "samples": samples, "stats": stats}
+            "pollInterval": PROBE_FRESH_MINUTES * 60,
+            "samples": samples, "stats": stats, "probeId": probe_id or ""}
 
 
 def _midnight_ts(dt_local):
@@ -800,19 +884,19 @@ def _midnight_ts(dt_local):
     return int(m.timestamp())
 
 
-def build_today(sid):
-    return _day_payload(sid, _midnight_ts(datetime.now(tz())), True)
+def build_today(sid, probe_id=None):
+    return _day_payload(sid, _midnight_ts(datetime.now(tz())), True, probe_id)
 
 
-def build_day(sid, date_str):
+def build_day(sid, date_str, probe_id=None):
     t = tz()
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d")
     except Exception:
-        return build_today(sid)
+        return build_today(sid, probe_id)
     ds = int(datetime(d.year, d.month, d.day, tzinfo=t).timestamp())
     today0 = _midnight_ts(datetime.now(t))
-    return _day_payload(sid, ds, ds == today0)
+    return _day_payload(sid, ds, ds == today0, probe_id)
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -984,13 +1068,26 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .actoggle.actogon{background:var(--ok);}
 .actoggle.actogon::before{transform:translateX(20px);}
 .actoggle:disabled{opacity:.45;cursor:not-allowed;}
-.prblist{display:flex;gap:8px 14px;padding:6px 15px 11px;flex-wrap:wrap;
+.bands{display:flex;flex-direction:column;gap:4px;padding:4px 15px 12px;
   border-top:1px dashed var(--line);margin:2px 0 0;}
-.prb{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--tx3);cursor:default;}
-.prbDot{width:7px;height:7px;border-radius:50%;flex:none;}
-.prbOk{background:var(--ok);}
-.prbBad{background:var(--bad);}
-.prb b{font-weight:500;color:var(--tx2);}
+.band{display:flex;align-items:center;gap:12px;cursor:pointer;padding:5px 8px;
+  border-radius:8px;transition:background .14s;}
+.band:hover{background:var(--hover);}
+.bandName{display:flex;align-items:center;gap:7px;width:140px;flex:none;min-width:0;
+  font-size:12.5px;color:var(--tx2);}
+.bandName .bandPName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bandDot{width:7px;height:7px;border-radius:50%;flex:none;}
+.bandDotOk{background:var(--ok);}
+.bandDotBad{background:var(--bad);}
+.bandDotStale{background:var(--tx3);}
+.bandBars{flex:1;height:18px;min-width:0;display:block;}
+.bandBars rect{transition:fill .3s, opacity .12s;}
+.bandBars rect:hover{opacity:.55;}
+.bandStat{width:110px;flex:none;text-align:right;}
+.bandPct{font-size:12.5px;font-weight:500;}
+.bandSub{font-size:11px;color:var(--tx3);}
+.emptyBands{padding:10px 15px 14px;font-size:12.5px;color:var(--tx3);font-style:italic;
+  border-top:1px dashed var(--line);}
 @media (max-width:560px){
   .wrap{padding:22px 14px 40px;}
   .brand h1{font-size:18px;} .brand p{font-size:12px;}
@@ -1212,18 +1309,24 @@ function panelH(panel){
   var it=panel.parentElement;
   if(it&&it.classList.contains("open"))panel.style.maxHeight=(panel.scrollHeight+40)+"px";
 }
-function openPanel(panel,sid){
+function _probeQ(pid){return pid?"&probe="+encodeURIComponent(pid):"";}
+function openPanel(panel,sid,pid){
   hideTip();
+  if(!pid){
+    panel.innerHTML='<div class="empty">Кликни на полосу пробника, чтобы увидеть его график пинга.</div>';
+    panelH(panel);return;
+  }
   if(!panel.innerHTML.trim()||panel.querySelector(".empty"))panel.innerHTML='<div class="empty">Загрузка…</div>';
-  fetch("api/today?sid="+encodeURIComponent(sid))
+  fetch("api/today?sid="+encodeURIComponent(sid)+_probeQ(pid))
     .then(function(r){return r.json();})
     .then(function(td){renderToday(panel,td);})
     .catch(function(){panel.innerHTML='<div class="empty">Не удалось загрузить.</div>';panelH(panel);});
 }
-function refreshPanel(panel,sid){
+function refreshPanel(panel,sid,pid){
+  if(!pid)return;
   var sc=panel.querySelector(".tscroll");
   var keep=sc?sc.scrollLeft:null;
-  fetch("api/today?sid="+encodeURIComponent(sid))
+  fetch("api/today?sid="+encodeURIComponent(sid)+_probeQ(pid))
     .then(function(r){return r.json();})
     .then(function(td){
       renderToday(panel,td);
@@ -1231,47 +1334,155 @@ function refreshPanel(panel,sid){
     })
     .catch(function(){});
 }
-function loadDay(panel,sid,date){
+function loadDay(panel,sid,date,pid){
   hideTip();
+  if(!pid){
+    panel.innerHTML='<div class="empty">Сначала выбери пробника (клик по его полосе).</div>';
+    panelH(panel);return;
+  }
   if(!panel.innerHTML.trim()||panel.querySelector(".empty"))panel.innerHTML='<div class="empty">Загрузка…</div>';
-  fetch("api/day?sid="+encodeURIComponent(sid)+"&date="+encodeURIComponent(date))
+  fetch("api/day?sid="+encodeURIComponent(sid)+"&date="+encodeURIComponent(date)+_probeQ(pid))
     .then(function(r){return r.json();})
     .then(function(td){renderToday(panel,td);})
     .catch(function(){panel.innerHTML='<div class="empty">Не удалось загрузить.</div>';panelH(panel);});
 }
 function applyServer(item,s,days){
   item._label._s=s;
-  item._dot.style.background=s.online?"#16b07a":"#e8504e";
-  for(var i=0;i<item._bars.length;i++){var d=s.days[i];if(d){item._bars[i]._d=d;item._bars[i].setAttribute("fill",colorFor(d));}}
+  // Точка статуса: зелёная если кто-то из пробников видит сервер,
+  // красная если все офлайн, серая если данных нет.
+  if(s.noData){item._dot.style.background="#cfd6df";}
+  else if(s.online){item._dot.style.background="#16b07a";}
+  else{item._dot.style.background="#e8504e";}
   item._p.textContent=(s.uptime30===null)?"—":s.uptime30.toFixed(2)+"%";
   item._p.style.color=srvUpColor(s.uptime30);
-  item._s2.textContent=(s.latencyMs?s.latencyMs+" ms · ":"")+days+" дн";
-  applyProbes(item,s.probes);
+  var sub="";
+  if(s.latencyMs)sub=s.latencyMs+" ms · ";
+  sub+=days+" дн";
+  item._s2.textContent=sub;
+  applyBands(item,s,days);
 }
-function applyProbes(item,probes){
-  var ex=item._prblist;
-  if(ex){ex.remove();item._prblist=null;}
-  if(!probes||!probes.length)return;
-  var list=document.createElement("div");list.className="prblist";
-  probes.forEach(function(p){
-    var span=document.createElement("span");span.className="prb";
-    var dot=document.createElement("span");
-    dot.className="prbDot "+(p.ok?"prbOk":"prbBad");
-    span.appendChild(dot);
-    span.appendChild(document.createTextNode(p.name));
-    if(p.ok&&p.rtt>0){
-      var b=document.createElement("b");b.textContent=p.rtt+" ms";
-      span.appendChild(document.createTextNode(" "));
-      span.appendChild(b);
-    }else if(!p.ok&&p.err){
-      span.title=p.err;
-    }
-    list.appendChild(span);
+function applyBands(item,s,days){
+  // Контейнер полос-пробников под .row.
+  var bands=item._bands;
+  if(!bands){
+    bands=document.createElement("div");bands.className="bands";
+    if(item._panel)item.insertBefore(bands,item._panel);
+    else item.appendChild(bands);
+    item._bands=bands;
+  }
+  var regional=s.regional||[];
+  if(!regional.length){
+    bands.className="emptyBands";
+    bands.textContent="Нет пробников. Поставь probe-агент в зоне блокировки — см. README.";
+    return;
+  }
+  bands.className="bands";
+  // Синкаем дочерние .band ноды с массивом regional.
+  // Старые удаляем; недостающие создаём.
+  var byPid={};
+  Array.prototype.forEach.call(bands.querySelectorAll(".band"),function(el){
+    byPid[el._pid]=el;
   });
-  // Вставляем между .row и .panel
-  if(item._panel)item.insertBefore(list,item._panel);
-  else item.appendChild(list);
-  item._prblist=list;
+  var seen={};
+  regional.forEach(function(r,idx){
+    seen[r.probe_id]=true;
+    var b=byPid[r.probe_id];
+    if(!b){b=buildBand(item,r,s);bands.appendChild(b);}
+    else updateBand(b,r);
+    // Поддерживаем порядок: если позиция в DOM не совпадает с индексом — переставляем.
+    if(bands.children[idx]!==b)bands.insertBefore(b,bands.children[idx]||null);
+  });
+  Array.prototype.slice.call(bands.querySelectorAll(".band")).forEach(function(el){
+    if(!seen[el._pid])el.remove();
+  });
+}
+function buildBand(item,r,s){
+  var b=document.createElement("div");b.className="band";b._pid=r.probe_id;
+  var nm=document.createElement("div");nm.className="bandName";
+  var dot=document.createElement("span");dot.className="bandDot";
+  var nmText=document.createElement("span");nmText.className="bandPName";
+  nmText.textContent=r.probe;
+  nm.appendChild(dot);nm.appendChild(nmText);
+  var bars=document.createElementNS(SVGNS,"svg");bars.setAttribute("class","bandBars");
+  bars.setAttribute("viewBox","0 0 1000 100");bars.setAttribute("preserveAspectRatio","none");
+  var st=document.createElement("div");st.className="bandStat";
+  var pct=document.createElement("div");pct.className="bandPct";
+  var sub=document.createElement("div");sub.className="bandSub";
+  st.appendChild(pct);st.appendChild(sub);
+  b.appendChild(nm);b.appendChild(bars);b.appendChild(st);
+  b._dot=dot;b._bars=bars;b._pct=pct;b._sub=sub;b._rects=[];
+  // Клик по полосе раскрывает панель именно для этого пробника.
+  b.addEventListener("click",function(e){
+    e.stopPropagation();
+    item._activeProbe=r.probe_id;
+    item._day=null;
+    if(!item.classList.contains("open")){
+      item.classList.add("open");
+    }
+    openPanel(item._panel,item._sid,r.probe_id);
+  });
+  updateBand(b,r);
+  return b;
+}
+function updateBand(b,r){
+  // Точка статуса полосы.
+  if(!r.fresh)b._dot.className="bandDot bandDotStale";
+  else if(r.online)b._dot.className="bandDot bandDotOk";
+  else b._dot.className="bandDot bandDotBad";
+  // SVG 30-дневная шкала.
+  var days=r.days||[];
+  var N=days.length||1;
+  var slot=1000/N,gap=Math.min(7,slot*0.32);
+  // Пересоздаём бары если число изменилось.
+  if(b._rects.length!==N){
+    while(b._bars.firstChild)b._bars.removeChild(b._bars.firstChild);
+    b._rects=[];
+    days.forEach(function(d,i){
+      var rect=document.createElementNS(SVGNS,"rect");
+      rect.setAttribute("x",(i*slot+gap/2).toFixed(2));rect.setAttribute("y","0");
+      rect.setAttribute("width",(slot-gap).toFixed(2));rect.setAttribute("height","100");
+      rect.setAttribute("rx","7");
+      rect._d=d;
+      rect.addEventListener("mouseenter",function(e){e.stopPropagation();showTipDay(e,this._d);});
+      rect.addEventListener("mousemove",moveTip);
+      rect.addEventListener("mouseleave",hideTip);
+      rect.addEventListener("click",function(e){
+        e.stopPropagation();
+        var bandEl=this.parentNode.parentNode;
+        var itemEl=bandEl.parentNode.parentNode;
+        itemEl._activeProbe=bandEl._pid;
+        itemEl._day=this._d.date;
+        if(!itemEl.classList.contains("open"))itemEl.classList.add("open");
+        loadDay(itemEl._panel,itemEl._sid,this._d.date,bandEl._pid);
+      });
+      b._bars.appendChild(rect);b._rects.push(rect);
+    });
+  }
+  for(var i=0;i<N;i++){
+    var d=days[i];if(!d)continue;
+    b._rects[i]._d=d;
+    b._rects[i].setAttribute("fill",colorFor(d));
+  }
+  // Текст справа.
+  if(r.uptime30===null){
+    b._pct.textContent="—";b._pct.style.color="var(--tx3)";
+  }else{
+    b._pct.textContent=r.uptime30.toFixed(2)+"%";
+    b._pct.style.color=srvUpColor(r.uptime30);
+  }
+  var line="";
+  if(!r.fresh){
+    var ago=Math.floor((Date.now()/1000-(r.lastSeenTs||0))/60);
+    line="нет данных "+(ago>0?ago+" мин":"только что");
+  }else if(r.online&&r.latencyMs>0){
+    line=r.latencyMs+" ms";
+  }else if(!r.online&&r.err){
+    line=r.err.length>32?r.err.slice(0,32)+"…":r.err;
+    b.title=r.err;
+  }else{
+    line="—";
+  }
+  b._sub.textContent=line;
 }
 function buildList(data){
   var list=document.getElementById("list");
@@ -1287,28 +1498,13 @@ function buildList(data){
     label.addEventListener("mouseenter",function(e){showTipServer(e,this._s);});
     label.addEventListener("mousemove",moveTip);
     label.addEventListener("mouseleave",hideTip);
-    var N=s.days.length||1;
-    var bars=document.createElementNS(SVGNS,"svg");bars.setAttribute("class","bars");
-    bars.setAttribute("viewBox","0 0 1000 100");bars.setAttribute("preserveAspectRatio","none");
-    var slot=1000/N,gap=Math.min(7,slot*0.32),barArr=[];
-    s.days.forEach(function(d,i){
-      var r=document.createElementNS(SVGNS,"rect");
-      r.setAttribute("x",(i*slot+gap/2).toFixed(2));r.setAttribute("y","0");
-      r.setAttribute("width",(slot-gap).toFixed(2));r.setAttribute("height","100");
-      r.setAttribute("rx","7");r.setAttribute("fill",colorFor(d));r._d=d;
-      r.addEventListener("mouseenter",function(e){showTipDay(e,this._d);});
-      r.addEventListener("mousemove",moveTip);
-      r.addEventListener("mouseleave",hideTip);
-      r.addEventListener("click",function(e){e.stopPropagation();item._day=this._d.date;item.classList.add("open");loadDay(item._panel,item._sid,this._d.date);});
-      bars.appendChild(r);barArr.push(r);
-    });
     var st2=document.createElement("div");st2.className="stat2";
     var pEl=document.createElement("div");pEl.className="p";
     var sEl=document.createElement("div");sEl.className="s";
     st2.appendChild(pEl);st2.appendChild(sEl);
     var chev=document.createElement("div");chev.className="chev";
     chev.innerHTML='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
-    row.appendChild(label);row.appendChild(bars);row.appendChild(st2);row.appendChild(chev);
+    row.appendChild(label);row.appendChild(st2);row.appendChild(chev);
     if(adminMode){
       var del=document.createElement("button");del.type="button";del.className="delbtn";
       del.title="Удалить сервер";del.setAttribute("aria-label","Удалить сервер");
@@ -1322,11 +1518,16 @@ function buildList(data){
         panel.style.maxHeight=panel.scrollHeight+"px";
         requestAnimationFrame(function(){item.classList.remove("open");panel.style.maxHeight="0px";});
       }else{
-        item._day=null;item.classList.add("open");openPanel(panel,item._sid);
+        item._day=null;
+        // Открываем для первого пробника, если есть.
+        var firstPid=(s.regional&&s.regional[0])?s.regional[0].probe_id:"";
+        item._activeProbe=firstPid;
+        item.classList.add("open");
+        openPanel(panel,item._sid,firstPid);
       }
     });
     item.appendChild(row);item.appendChild(panel);
-    item._dot=label.querySelector(".sdot");item._bars=barArr;item._p=pEl;item._s2=sEl;item._label=label;item._panel=panel;
+    item._dot=label.querySelector(".sdot");item._p=pEl;item._s2=sEl;item._label=label;item._panel=panel;
     applyServer(item,s,data.days);
     list.appendChild(item);order.push(s.sid);nodes[s.sid]=item;
   });
@@ -1345,7 +1546,12 @@ function render(data){
   var fresh=data.lastCheck!==lastSeen;lastSeen=data.lastCheck;
   if(sameOrder(data)){
     data.servers.forEach(function(s){var item=nodes[s.sid];if(item)applyServer(item,s,data.days);});
-    if(fresh)for(var sid in nodes){var it=nodes[sid];if(it.classList.contains("open")&&(it._day===null||it._day===undefined))refreshPanel(it._panel,it._sid);}
+    if(fresh)for(var sid in nodes){
+      var it=nodes[sid];
+      if(it.classList.contains("open")&&(it._day===null||it._day===undefined)){
+        refreshPanel(it._panel,it._sid,it._activeProbe||"");
+      }
+    }
   }else{
     buildList(data);
   }
@@ -1530,7 +1736,9 @@ _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "overall", "pgrad",
                 "delbtn", "lockon", "lock",
                 "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked",
-                "prblist", "prbDot", "prbOk", "prbBad", "prb"]
+                "bands", "band", "bandName", "bandPName", "bandDot",
+                "bandDotOk", "bandDotBad", "bandDotStale", "bandBars",
+                "bandStat", "bandPct", "bandSub", "emptyBands"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
@@ -1627,13 +1835,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/today":
             qs = parse_qs(parsed.query)
             sid = (qs.get("sid") or [""])[0]
-            self._send(200, json.dumps(build_today(sid), ensure_ascii=False),
+            probe_id = (qs.get("probe") or [""])[0]
+            self._send(200,
+                       json.dumps(build_today(sid, probe_id), ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path == "/api/day":
             qs = parse_qs(parsed.query)
             sid = (qs.get("sid") or [""])[0]
             date = (qs.get("date") or [""])[0]
-            self._send(200, json.dumps(build_day(sid, date), ensure_ascii=False),
+            probe_id = (qs.get("probe") or [""])[0]
+            self._send(200,
+                       json.dumps(build_day(sid, date, probe_id), ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path in ("/favicon.ico", "/favicon.png", "/logo"):
             img = find_brand_image()
