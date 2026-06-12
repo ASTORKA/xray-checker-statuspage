@@ -462,13 +462,15 @@ def xray_probe(xray_bin, t, direct_ip=""):
             body = r.read(2048).decode("utf-8", "ignore")
             rtt = int((time.monotonic() - t0) * 1000)
             if PROBE_TEST_MARKER not in body:
-                return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
+                # Туннель отдал что-то неожиданное — для UI это «нет соединения»;
+                # причину не гадаем (DPI, fallback, что угодно).
+                return False, 0, "нет соединения"
             # Проверка 1: ip из ответа должен отличаться от прямого. Если
-            # совпадает — xray молча упал в direct (или DPI пропустил голый).
+            # совпадает — xray молча упал в direct (или другой VPN перехватил).
+            # Это НЕ «сервер не работает», а «не смогли честно проверить».
             tunnel_ip = _parse_trace_ip(body)
             if direct_ip and tunnel_ip and tunnel_ip == direct_ip:
-                return False, 0, ("туннель не использовался: ip совпадает "
-                                  "с прямым (%s)" % tunnel_ip)
+                return False, 0, "проба недостоверна (трафик пошёл напрямую)"
             # Проверка 2 (BURST): открываем PROBE_BURST_COUNT параллельных
             # соединений к PROBE_BULK_URL через туннель. Это и есть главный
             # тест — одиночный коннект проходит даже на заблокированном
@@ -478,17 +480,20 @@ def xray_probe(xray_bin, t, direct_ip=""):
                 port, PROBE_BURST_COUNT, PROBE_BULK_URL, PROBE_BULK_USER_AGENT)
             ratio = (ok_n / total_n) if total_n else 0.0
             if ratio < PROBE_BURST_OK_RATIO:
-                return False, 0, ("DPI режет под нагрузкой: прошло %d/%d "
-                                  "параллельных коннектов (заблокированный "
-                                  "fingerprint?)" % (ok_n, total_n))
+                # Не атрибутируем причину (fingerprint/SNI/IP/что угодно) —
+                # для пользователя это просто «нет соединения».
+                return False, 0, "нет соединения (%d/%d проверок прошло)" % (ok_n, total_n)
             return True, rtt, ""
         except urllib.error.URLError as e:
-            # Туннель не открылся — внутри xray может быть лог почему.
+            # Туннель не открылся. Полная причина — в agent.log (для админа),
+            # на сайте показываем нейтральное «нет соединения».
             _dump_xray_io("xray probe URLError")
-            return False, 0, "туннель: " + str(e.reason)[:140]
+            err("probe URLError: %s" % str(e.reason)[:140])
+            return False, 0, "нет соединения"
         except (socket.timeout, OSError) as e:
             _dump_xray_io("xray probe %s" % type(e).__name__)
-            return False, 0, type(e).__name__ + ": " + str(e)[:140]
+            err("probe %s: %s" % (type(e).__name__, str(e)[:140]))
+            return False, 0, "нет соединения"
     finally:
         if proc is not None:
             try:

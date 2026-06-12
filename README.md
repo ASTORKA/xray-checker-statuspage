@@ -327,22 +327,32 @@ monitorvpn delete      полностью удалить (plist + ~/.xrs-probe +
 Если `/usr/local/bin/` без прав на запись — установщик подскажет точную `sudo ln -s …`
 команду. До этого вызов можно делать через полный путь: `~/.xrs-probe/monitorvpn status`.
 
-**Поставить пробника на Windows** (нужен Python 3.10+ — `winget install Python.Python.3.12`,
-плюс `ADMIN_TOKEN` со страницы):
+**Поставить пробника на Windows** (нужен **настоящий** Python 3.10+ и `ADMIN_TOKEN`
+со страницы):
 
 ```powershell
-# В PowerShell (не обязательно admin — пробник работает в твоей пользовательской сессии)
+# 0) Поставить Python (если ещё нет). ВАЖНО: не «заглушку» из Microsoft Store,
+#    а полноценный Python — например, через winget:
+winget install -e --id Python.Python.3.12
+
+# 1) Скачать и запустить установщик пробника
 mkdir ~\xrs-probe; cd ~\xrs-probe
 curl.exe -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
 powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 # спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
 ```
 
-> По умолчанию Windows блокирует запуск неподписанных `.ps1` (`running scripts is
-> disabled on this system`). Поэтому запускаем через `powershell -ExecutionPolicy
-> Bypass -File …` — это обходит политику **только для одного запуска**, не меняя
-> системных настроек и не требуя админа. (Альтернатива: один раз
+> **Про PowerShell.** По умолчанию Windows блокирует неподписанные `.ps1` (`running
+> scripts is disabled on this system`). Поэтому запускаем через `powershell
+> -ExecutionPolicy Bypass -File …` — обход политики **только для одного запуска**, без
+> прав админа и без правки системных настроек. (Альтернатива: один раз
 > `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, затем `.\install-windows.ps1`.)
+>
+> **Про Python.** Нужен реальный интерпретатор. «Заглушка» Microsoft Store (когда
+> `python` открывает магазин и пишет *«Python was not found»*) не подойдёт. Установщик
+> сам находит настоящий `python.exe` (минуя launcher `py.exe`, который иначе уходит по
+> shebang в стор-заглушку). Проверить, что Python реально установлен:
+> `python --version` должен напечатать версию, а не открыть Store.
 
 Что происходит:
 - Регистрирует пробника на сервере (`mode=merge` — если уже был пробник с этим
