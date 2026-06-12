@@ -1,3 +1,4 @@
+import base64
 import gzip
 import json
 import os
@@ -298,9 +299,8 @@ def _fetch_subscription_text():
     # Подписки часто base64. Если в raw нет prefix'ов — декодируем.
     if "vless://" not in raw and "vmess://" not in raw and "trojan://" not in raw:
         try:
-            import base64 as _b64
             padded = raw + "=" * (-len(raw) % 4)
-            decoded = _b64.b64decode(padded).decode("utf-8", "ignore")
+            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
             if "vless://" in decoded or "vmess://" in decoded:
                 raw = decoded
         except Exception:
@@ -1680,6 +1680,77 @@ class Handler(BaseHTTPRequestHandler):
                        json.dumps({"probes": list_probes(),
                                    "freshMinutes": PROBE_FRESH_MINUTES},
                                   ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/admin/probe-diag":
+            # Диагностика: сходить на PROBE_SUBSCRIPTION_URL с набором популярных
+            # User-Agent'ов и показать первые байты ответа + кол-во распарсенных
+            # vless-таргетов. Помогает подобрать правильный UA для подписки.
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            if not PROBE_SUBSCRIPTION_URL:
+                self._send(503, '{"error":"PROBE_SUBSCRIPTION_URL не задан"}',
+                           "application/json; charset=utf-8")
+                return
+            uas = [
+                PROBE_SUBSCRIPTION_USER_AGENT,
+                "v2rayN/6.40", "v2rayN/6.0", "v2rayNG/1.8.0",
+                "Streisand/1.0", "Streisand/1.6",
+                "clash-verge/1.5.0", "ClashX/1.95",
+                "sing-box/1.8", "sing-box/1.10",
+                "Shadowrocket/1.0", "Quantumult%20X/1.0",
+                "Mozilla/5.0",
+            ]
+            seen = set()
+            results = []
+            for ua in uas:
+                if ua in seen:
+                    continue
+                seen.add(ua)
+                rec = {"ua": ua}
+                try:
+                    req = urllib.request.Request(
+                        PROBE_SUBSCRIPTION_URL, headers={"User-Agent": ua})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        body = r.read()
+                        rec["status"] = r.status
+                        rec["contentType"] = r.headers.get("Content-Type", "")
+                        rec["bytes"] = len(body)
+                        rec["headSample"] = body[:240].decode("utf-8", "replace")
+                    # Прогоняем через ту же логику парсера.
+                    text = body.decode("utf-8", "ignore").strip()
+                    if ("vless://" not in text and "vmess://" not in text
+                            and "trojan://" not in text):
+                        try:
+                            padded = text + "=" * (-len(text) % 4)
+                            decoded = base64.b64decode(padded).decode(
+                                "utf-8", "ignore")
+                            if "vless://" in decoded:
+                                text = decoded
+                                rec["base64Decoded"] = True
+                        except Exception:
+                            pass
+                    n_lines = sum(1 for ln in text.splitlines() if ln.strip())
+                    n_vless = sum(1 for ln in text.splitlines()
+                                  if ln.strip().startswith("vless://"))
+                    parsed = []
+                    for ln in text.splitlines():
+                        t = _parse_vless_line(ln.strip())
+                        if t:
+                            parsed.append({"name": t["name"], "host": t["host"]})
+                    rec["lines"] = n_lines
+                    rec["vlessLines"] = n_vless
+                    rec["parsedTargets"] = len(parsed)
+                    rec["sampleTargets"] = parsed[:3]
+                except Exception as e:
+                    rec["error"] = str(e)
+                results.append(rec)
+            self._send(200,
+                       json.dumps({"url": PROBE_SUBSCRIPTION_URL,
+                                   "currentUA": PROBE_SUBSCRIPTION_USER_AGENT,
+                                   "tries": results},
+                                  ensure_ascii=False, indent=2),
                        "application/json; charset=utf-8")
         elif path == "/api/probe/targets":
             # Список таргетов для пробника. Аутентификация — X-Probe-Token.
