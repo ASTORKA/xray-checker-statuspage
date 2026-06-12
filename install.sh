@@ -2,7 +2,16 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/ASTORKA/xray-checker-statuspage.git"
-REPO_BRANCH="main"
+# Ветка, с которой ensure_source синкает ./src. По умолчанию main, но если
+# install.sh запущен ИЗ git-клона на другой ветке — берём ту же ветку, чтобы
+# не возникало рассинхрона «верх репо на feat, а src сидит на main».
+# Override через env: REPO_BRANCH=feat/... sudo bash install.sh.
+_SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${REPO_BRANCH:-}" ] && [ -d "${_SELF_DIR}/.git" ]; then
+  REPO_BRANCH="$(git -C "${_SELF_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  [ "${REPO_BRANCH}" = "HEAD" ] && REPO_BRANCH="main"
+fi
+REPO_BRANCH="${REPO_BRANCH:-main}"
 SRC_DIR_REL="src"
 INSTALL_DIR="/opt/xray-checker-statuspage"
 
