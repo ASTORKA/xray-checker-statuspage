@@ -372,16 +372,29 @@ def find_probe_by_token(token):
     return row if row else None
 
 
-def create_probe(name):
+def create_probe(name, replace=False):
+    """Создаёт нового пробника. Если replace=True — удаляет всех существующих
+    с тем же именем (вместе с их probe_samples/probe_daily). Это нужно
+    чтобы повторный запуск install-macos.sh не плодил дубли."""
     name = (name or "").strip() or "probe"
     pid = _gen_probe_id()
     tok = _gen_probe_token()
     now = int(time.time())
+    removed = 0
     with _lock, conn() as c:
+        if replace:
+            old = [r[0] for r in c.execute(
+                "SELECT probe_id FROM probes WHERE name=?", (name,)).fetchall()]
+            for opid in old:
+                c.execute("DELETE FROM probes WHERE probe_id=?", (opid,))
+                c.execute("DELETE FROM probe_samples WHERE probe_id=?", (opid,))
+                c.execute("DELETE FROM probe_daily WHERE probe_id=?", (opid,))
+            removed = len(old)
         c.execute("""INSERT INTO probes(probe_id, name, token_hash, created_at)
                      VALUES(?,?,?,?)""",
                   (pid, name, _hash_token(tok), now))
-    return {"probe_id": pid, "name": name, "probe_token": tok, "created_at": now}
+    return {"probe_id": pid, "name": name, "probe_token": tok,
+            "created_at": now, "replaced": removed}
 
 
 def list_probes():
@@ -705,27 +718,36 @@ def build_summary():
         canon_sid = sorted(members, key=lambda x: x[4])[0][0]
         cc = detect_country(name)
 
-        # Для каждого зарегистрированного пробника строим полосу.
-        regional = []
+        # Группируем зарегистрированных пробников по ИМЕНИ: несколько probe_id
+        # с одним name считаются одним физическим устройством (например,
+        # повторная установка install-macos.sh создала дубль). Их данные
+        # объединяются в одну полосу.
+        probes_by_name = {}
         for pid, pinfo in probe_info.items():
-            # Дневные агрегаты этого пробника по всем sid группы.
+            probes_by_name.setdefault(pinfo["name"], []).append(pid)
+
+        regional = []
+        for probe_name in sorted(probes_by_name):
+            pids = probes_by_name[probe_name]
+            # Дневные агрегаты по всем sid группы и всем probe_id с этим именем.
             days = []
             s_up = 0
             s_total = 0
             s_down_min = 0
             for d in day_list:
                 sum_up = sum_total = sum_dc = 0
-                n_with_data = 0
+                n_records = 0
                 for sid in member_sids:
-                    rec = daily_by_pid_sid.get((pid, sid), {}).get(d)
-                    if rec:
-                        n_with_data += 1
-                        sum_up += rec[0]
-                        sum_total += rec[0] + rec[1]
-                        sum_dc += rec[4]
+                    for pid in pids:
+                        rec = daily_by_pid_sid.get((pid, sid), {}).get(d)
+                        if rec:
+                            n_records += 1
+                            sum_up += rec[0]
+                            sum_total += rec[0] + rec[1]
+                            sum_dc += rec[4]
                 if sum_total > 0:
                     pct = round(sum_up / sum_total * 100, 2)
-                    down_min_d = round(sum_dc / max(n_with_data, 1) * poll_interval_min)
+                    down_min_d = round(sum_dc / max(n_records, 1) * poll_interval_min)
                     s_up += sum_up
                     s_total += sum_total
                     s_down_min += down_min_d
@@ -738,21 +760,23 @@ def build_summary():
                 label = dd + " " + RU_MONTHS[int(m)]
                 days.append({"date": d, "label": label, "uptime": pct,
                              "downMin": down_min_d, "hasData": has_data})
-            # Самый свежий sample по этой группе для этого пробника.
+            # Самый свежий sample по группе и всем pid этого имени.
             latest = None
             for sid in member_sids:
-                cand = latest_by_pid_sid.get((pid, sid))
-                if cand and (latest is None or cand["ts"] > latest["ts"]):
-                    latest = cand
-            # Свежий = от пробника пришло что-то за окно «свежести» по любому sid.
+                for pid in pids:
+                    cand = latest_by_pid_sid.get((pid, sid))
+                    if cand and (latest is None or cand["ts"] > latest["ts"]):
+                        latest = cand
             fresh = bool(latest and latest["ts"] >= fresh_cutoff)
-            # Пропускаем полосу, если у этого пробника вообще нет НИКАКИХ данных
-            # по этой группе (ни дневных, ни sample) — нечего показывать.
             if s_total == 0 and latest is None:
                 continue
             band = {
-                "probe_id": pid,
-                "probe": pinfo["name"],
+                # Канонический probe_id — первый по дате создания. Используется
+                # как fallback для legacy-фронтов; новый UI идентифицирует
+                # полосу по `probe` (имени).
+                "probe_id": pids[0],
+                "probe": probe_name,
+                "probeIds": pids,
                 "fresh": fresh,
                 "lastSeenTs": latest["ts"] if latest else 0,
                 "online": (latest["ok"] if (latest and fresh) else False),
@@ -827,27 +851,36 @@ def build_summary():
     }
 
 
-def _day_payload(sid, ds, is_today, probe_id=None):
-    """Сэмплы за конкретный день. В новой модели ТОЛЬКО от пробников: probe_id —
-    обязательно. Без probe_id — пустой результат (UI должен передавать).
-    Для совместимости вызов без probe_id возвращает пустые samples."""
+def _day_payload(sid, ds, is_today, probe_id=None, probe_name=None):
+    """Сэмплы за конкретный день. ТОЛЬКО от пробников.
+    Если задан probe_name — резолвим его в список probe_id с этим именем и
+    мерджим сэмплы всех (несколько устройств с одним именем = одно физическое).
+    Если задан probe_id — используем только его. Без обоих — пустой результат."""
     end = ds + 86400
     upper = int(time.time()) if is_today else end
     samples = []
-    if probe_id:
-        with _lock, conn() as c:
+    pids = []
+    with _lock, conn() as c:
+        if probe_name and not probe_id:
+            pids = [r[0] for r in c.execute(
+                "SELECT probe_id FROM probes WHERE name=?", (probe_name,)).fetchall()]
+        elif probe_id:
+            pids = [probe_id]
+        rows = []
+        if pids:
             row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
             if row:
                 members = [r[0] for r in c.execute(
                     "SELECT sid FROM current WHERE name=?", (row[0],)).fetchall()]
             else:
                 members = [sid]
-            placeholders = ",".join("?" * len(members))
+            sid_ph = ",".join("?" * len(members))
+            pid_ph = ",".join("?" * len(pids))
             rows = c.execute(
-                "SELECT ts, ok, rtt FROM probe_samples "
-                f"WHERE probe_id=? AND sid IN ({placeholders}) "
+                f"SELECT ts, ok, rtt FROM probe_samples "
+                f"WHERE probe_id IN ({pid_ph}) AND sid IN ({sid_ph}) "
                 "AND ts>=? AND ts<? ORDER BY ts",
-                (probe_id,) + tuple(members) + (ds, end)).fetchall()
+                tuple(pids) + tuple(members) + (ds, end)).fetchall()
         # Роллап по ts.
         buckets = {}
         for ts, ok, rtt in rows:
@@ -884,19 +917,20 @@ def _midnight_ts(dt_local):
     return int(m.timestamp())
 
 
-def build_today(sid, probe_id=None):
-    return _day_payload(sid, _midnight_ts(datetime.now(tz())), True, probe_id)
+def build_today(sid, probe_id=None, probe_name=None):
+    return _day_payload(sid, _midnight_ts(datetime.now(tz())), True,
+                        probe_id, probe_name)
 
 
-def build_day(sid, date_str, probe_id=None):
+def build_day(sid, date_str, probe_id=None, probe_name=None):
     t = tz()
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d")
     except Exception:
-        return build_today(sid, probe_id)
+        return build_today(sid, probe_id, probe_name)
     ds = int(datetime(d.year, d.month, d.day, tzinfo=t).timestamp())
     today0 = _midnight_ts(datetime.now(t))
-    return _day_payload(sid, ds, ds == today0, probe_id)
+    return _day_payload(sid, ds, ds == today0, probe_id, probe_name)
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -1309,24 +1343,24 @@ function panelH(panel){
   var it=panel.parentElement;
   if(it&&it.classList.contains("open"))panel.style.maxHeight=(panel.scrollHeight+40)+"px";
 }
-function _probeQ(pid){return pid?"&probe="+encodeURIComponent(pid):"";}
-function openPanel(panel,sid,pid){
+function _probeQ(name){return name?"&probeName="+encodeURIComponent(name):"";}
+function openPanel(panel,sid,probeName){
   hideTip();
-  if(!pid){
+  if(!probeName){
     panel.innerHTML='<div class="empty">Кликни на полосу пробника, чтобы увидеть его график пинга.</div>';
     panelH(panel);return;
   }
   if(!panel.innerHTML.trim()||panel.querySelector(".empty"))panel.innerHTML='<div class="empty">Загрузка…</div>';
-  fetch("api/today?sid="+encodeURIComponent(sid)+_probeQ(pid))
+  fetch("api/today?sid="+encodeURIComponent(sid)+_probeQ(probeName))
     .then(function(r){return r.json();})
     .then(function(td){renderToday(panel,td);})
     .catch(function(){panel.innerHTML='<div class="empty">Не удалось загрузить.</div>';panelH(panel);});
 }
-function refreshPanel(panel,sid,pid){
-  if(!pid)return;
+function refreshPanel(panel,sid,probeName){
+  if(!probeName)return;
   var sc=panel.querySelector(".tscroll");
   var keep=sc?sc.scrollLeft:null;
-  fetch("api/today?sid="+encodeURIComponent(sid)+_probeQ(pid))
+  fetch("api/today?sid="+encodeURIComponent(sid)+_probeQ(probeName))
     .then(function(r){return r.json();})
     .then(function(td){
       renderToday(panel,td);
@@ -1334,14 +1368,14 @@ function refreshPanel(panel,sid,pid){
     })
     .catch(function(){});
 }
-function loadDay(panel,sid,date,pid){
+function loadDay(panel,sid,date,probeName){
   hideTip();
-  if(!pid){
+  if(!probeName){
     panel.innerHTML='<div class="empty">Сначала выбери пробника (клик по его полосе).</div>';
     panelH(panel);return;
   }
   if(!panel.innerHTML.trim()||panel.querySelector(".empty"))panel.innerHTML='<div class="empty">Загрузка…</div>';
-  fetch("api/day?sid="+encodeURIComponent(sid)+"&date="+encodeURIComponent(date)+_probeQ(pid))
+  fetch("api/day?sid="+encodeURIComponent(sid)+"&date="+encodeURIComponent(date)+_probeQ(probeName))
     .then(function(r){return r.json();})
     .then(function(td){renderToday(panel,td);})
     .catch(function(){panel.innerHTML='<div class="empty">Не удалось загрузить.</div>';panelH(panel);});
@@ -1377,19 +1411,18 @@ function applyBands(item,s,days){
     return;
   }
   bands.className="bands";
-  // Синкаем дочерние .band ноды с массивом regional.
-  // Старые удаляем; недостающие создаём.
-  var byPid={};
+  // Синкаем .band ноды с regional. Идентификатор полосы = ИМЯ пробника,
+  // потому что несколько probe_id с одним именем мерджатся в одну полосу.
+  var byName={};
   Array.prototype.forEach.call(bands.querySelectorAll(".band"),function(el){
-    byPid[el._pid]=el;
+    byName[el._pid]=el;
   });
   var seen={};
   regional.forEach(function(r,idx){
-    seen[r.probe_id]=true;
-    var b=byPid[r.probe_id];
+    seen[r.probe]=true;
+    var b=byName[r.probe];
     if(!b){b=buildBand(item,r,s);bands.appendChild(b);}
     else updateBand(b,r);
-    // Поддерживаем порядок: если позиция в DOM не совпадает с индексом — переставляем.
     if(bands.children[idx]!==b)bands.insertBefore(b,bands.children[idx]||null);
   });
   Array.prototype.slice.call(bands.querySelectorAll(".band")).forEach(function(el){
@@ -1397,7 +1430,7 @@ function applyBands(item,s,days){
   });
 }
 function buildBand(item,r,s){
-  var b=document.createElement("div");b.className="band";b._pid=r.probe_id;
+  var b=document.createElement("div");b.className="band";b._pid=r.probe;b._probeName=r.probe;
   var nm=document.createElement("div");nm.className="bandName";
   var dot=document.createElement("span");dot.className="bandDot";
   var nmText=document.createElement("span");nmText.className="bandPName";
@@ -1411,15 +1444,16 @@ function buildBand(item,r,s){
   st.appendChild(pct);st.appendChild(sub);
   b.appendChild(nm);b.appendChild(bars);b.appendChild(st);
   b._dot=dot;b._bars=bars;b._pct=pct;b._sub=sub;b._rects=[];
-  // Клик по полосе раскрывает панель именно для этого пробника.
+  // Клик по полосе раскрывает панель именно для этого пробника (по имени —
+  // на бэке мерджатся все probe_id с этим именем).
   b.addEventListener("click",function(e){
     e.stopPropagation();
-    item._activeProbe=r.probe_id;
+    item._activeProbe=r.probe;
     item._day=null;
     if(!item.classList.contains("open")){
       item.classList.add("open");
     }
-    openPanel(item._panel,item._sid,r.probe_id);
+    openPanel(item._panel,item._sid,r.probe);
   });
   updateBand(b,r);
   return b;
@@ -1450,10 +1484,10 @@ function updateBand(b,r){
         e.stopPropagation();
         var bandEl=this.parentNode.parentNode;
         var itemEl=bandEl.parentNode.parentNode;
-        itemEl._activeProbe=bandEl._pid;
+        itemEl._activeProbe=bandEl._probeName||bandEl._pid;
         itemEl._day=this._d.date;
         if(!itemEl.classList.contains("open"))itemEl.classList.add("open");
-        loadDay(itemEl._panel,itemEl._sid,this._d.date,bandEl._pid);
+        loadDay(itemEl._panel,itemEl._sid,this._d.date,bandEl._probeName||bandEl._pid);
       });
       b._bars.appendChild(rect);b._rects.push(rect);
     });
@@ -1520,10 +1554,10 @@ function buildList(data){
       }else{
         item._day=null;
         // Открываем для первого пробника, если есть.
-        var firstPid=(s.regional&&s.regional[0])?s.regional[0].probe_id:"";
-        item._activeProbe=firstPid;
+        var firstName=(s.regional&&s.regional[0])?s.regional[0].probe:"";
+        item._activeProbe=firstName;
         item.classList.add("open");
-        openPanel(panel,item._sid,firstPid);
+        openPanel(panel,item._sid,firstName);
       }
     });
     item.appendChild(row);item.appendChild(panel);
@@ -1836,16 +1870,20 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             sid = (qs.get("sid") or [""])[0]
             probe_id = (qs.get("probe") or [""])[0]
+            probe_name = (qs.get("probeName") or [""])[0]
             self._send(200,
-                       json.dumps(build_today(sid, probe_id), ensure_ascii=False),
+                       json.dumps(build_today(sid, probe_id, probe_name),
+                                  ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path == "/api/day":
             qs = parse_qs(parsed.query)
             sid = (qs.get("sid") or [""])[0]
             date = (qs.get("date") or [""])[0]
             probe_id = (qs.get("probe") or [""])[0]
+            probe_name = (qs.get("probeName") or [""])[0]
             self._send(200,
-                       json.dumps(build_day(sid, date, probe_id), ensure_ascii=False),
+                       json.dumps(build_day(sid, date, probe_id, probe_name),
+                                  ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path in ("/favicon.ico", "/favicon.png", "/logo"):
             img = find_brand_image()
@@ -2060,7 +2098,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = self._read_json()
             name = (body.get("name") if isinstance(body, dict) else "") or ""
-            probe = create_probe(name)
+            replace = bool(body.get("replace")) if isinstance(body, dict) else False
+            probe = create_probe(name, replace=replace)
             self._send(200,
                        json.dumps({"ok": True, **probe}, ensure_ascii=False),
                        "application/json; charset=utf-8")

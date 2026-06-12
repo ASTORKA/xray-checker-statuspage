@@ -67,7 +67,7 @@ c_g "→ регистрируем пробник на сервере…"
 RESP="$(curl -fsSL -X POST \
   -H "X-Admin-Token: ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"${PROBE_NAME}\"}" \
+  -d "{\"name\":\"${PROBE_NAME}\",\"replace\":true}" \
   "${STATUSPAGE_URL}/api/admin/probes")" \
   || die "регистрация не удалась. Проверь URL и ADMIN_TOKEN."
 PROBE_ID="$(echo "${RESP}" | "${PYTHON}" -c 'import sys,json;print(json.load(sys.stdin)["probe_id"])')" \
