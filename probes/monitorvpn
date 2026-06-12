@@ -35,8 +35,15 @@ monitorvpn — управление probe-агентом xray-checker-statuspage
   monitorvpn restart       перезапустить
   monitorvpn status        показать статус и последние строки лога
   monitorvpn logs          tail -f лог-файла
+  monitorvpn refresh       попросить сервер перечитать подписку (когда ты её обновил)
   monitorvpn delete        полностью удалить (plist + ~/.xrs-probe/ + symlink)
 EOF
+}
+
+# Читает значения переменных окружения из plist (для refresh-команды).
+plist_env(){
+  local key="$1"
+  /usr/bin/plutil -extract "EnvironmentVariables.${key}" raw -o - "${PLIST}" 2>/dev/null
 }
 
 cmd="${1:-status}"
@@ -93,6 +100,25 @@ case "${cmd}" in
   logs|log|tail)
     [ -f "${LOG}" ] || { c_r "лог-файл не найден: ${LOG}"; exit 1; }
     tail -n 30 -f "${LOG}"
+    ;;
+  refresh|reload)
+    [ -f "${PLIST}" ] || { c_r "пробник не установлен"; exit 1; }
+    URL="$(plist_env STATUSPAGE_URL)"
+    TOKEN="$(plist_env PROBE_TOKEN)"
+    [ -n "${URL}" ] && [ -n "${TOKEN}" ] || { c_r "не могу прочитать STATUSPAGE_URL/PROBE_TOKEN из plist"; exit 1; }
+    c_y "запрашиваю force-refresh подписки на сервере…"
+    RESP="$(curl -fsSL -H "X-Probe-Token: ${TOKEN}" \
+            "${URL%/}/api/probe/targets?force=1" 2>&1)" \
+      || { c_r "не удалось:\n${RESP}"; exit 1; }
+    echo "${RESP}" | /usr/bin/python3 -c '
+import sys, json, datetime as dt
+d = json.load(sys.stdin)
+n = len(d.get("targets", []))
+ts = d.get("fetchedAt", 0)
+when = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
+print(f"✓ сервер вернул {n} таргетов (fetchedAt={when})")
+print("  пробник подхватит обновлённый список со следующим циклом (через INTERVAL сек).")
+'
     ;;
   delete|uninstall|rm)
     c_y "Удаление…"

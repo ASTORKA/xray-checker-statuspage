@@ -345,28 +345,58 @@ monitorvpn stop        остановить
 monitorvpn restart     перезапустить
 monitorvpn status      статус + последние строки лога
 monitorvpn logs        tail -f лога
+monitorvpn refresh     попросить сервер перечитать подписку (когда ты её обновил)
 monitorvpn delete      полностью удалить (plist + ~/.xrs-probe + symlink)
 ```
 
 Если `/usr/local/bin/` без прав на запись — установщик подскажет точную `sudo ln -s …`
 команду. До этого вызов можно делать через полный путь: `~/.xrs-probe/monitorvpn status`.
 
+**Поставить пробника на Windows** (нужен Python 3.10+ — `winget install Python.Python.3.12`,
+плюс `ADMIN_TOKEN` со страницы):
+
+```powershell
+# В PowerShell (не обязательно admin — пробник работает в твоей пользовательской сессии)
+mkdir ~\xrs-probe; cd ~\xrs-probe
+curl.exe -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
+.\install-windows.ps1
+# спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
+```
+
+Что происходит:
+- Регистрирует пробника на сервере (`mode=merge` — если уже был пробник с этим
+  именем, переиспользуется его `probe_id`, история сохраняется).
+- Кладёт `agent.py` и `monitorvpn.ps1` в `%USERPROFILE%\.xrs-probe\`.
+- Создаёт **Scheduled Task `XrayCheckerProbe`** с триггером «при входе в систему»
+  и авто-перезапуском при падении.
+- Кладёт `monitorvpn.cmd` в `%USERPROFILE%\.local\bin\` и добавляет эту папку в
+  User PATH (перезайди в PowerShell после установки).
+- Логи: `%USERPROFILE%\.xrs-probe\agent.log`.
+
+Команды `monitorvpn` те же, что на macOS. Снести: `monitorvpn delete` или
+`.\install-windows.ps1 -Uninstall`.
+
+**Обновление подписки на сервере.** Сервер тянет подписку в момент запроса от
+пробника, кеширует на `PROBE_TARGETS_TTL_MIN` минут (по умолчанию 10). Когда
+обновляешь подписку (новые сервера, или сменился `SUBSCRIPTION_URL`), пробники
+подхватят изменения автоматически в течение этого окна. Если нужно сейчас —
+команда `monitorvpn refresh`: пробник пинает сервер с `?force=1`, кеш
+инвалидируется, новый список приходит на следующем цикле агента.
+
 **Что проверяет агент в первой итерации:**
 - Только vless:// конфиги (для VLESS-REALITY и VLESS-TLS).
 - TCP-connect + TLS handshake к `host:port` с правильным SNI. Сертификат не верифицируется
   (REALITY использует невалидный — это норма). Если DPI обрывает на ClientHello — увидим
   `ConnectionResetError`. Если IP заблокирован — `TimeoutError`/`refused`.
-- При каждом цикле проверяет свою геолокацию через `ifconfig.co` — если страна не
-  совпадает с `EXPECT_COUNTRY` (по умолчанию `RU`), пишет предупреждение в лог
-  (вероятно, на устройстве включён VPN — пробы могут быть искажены).
+- При каждом цикле проверяет свою геолокацию через `ifconfig.co`. Если страна не
+  совпадает с `EXPECT_COUNTRY` (по умолчанию `RU`) — **отчёт не отправляется** (защита от
+  загрязнения истории, когда на устройстве пробника включён VPN).
 
 **Ограничения MVP:**
 - vmess://, trojan:// пока не парсятся.
 - TLS-fingerprint имитации (uTLS chrome/firefox) нет — это можно увидеть в следующей
   итерации через `curl-impersonate`. Но даже стандартный Python TLS уже ловит большинство
   блокировок по SNI и IP.
-- Если у пробника включён VPN — он сам предупредит в лог, но репорты всё равно пойдут.
-  В UI пока нет фильтра по гео — добавим, если будет нужно.
 
 ## Частота опроса
 
