@@ -99,6 +99,33 @@ else
 fi
 chmod +x "${APP_DIR}/monitorvpn" 2>/dev/null || true
 
+# xray-core: качаем последний релиз с github.com/XTLS/Xray-core под архитектуру.
+# Без него агент не сможет валидировать конфиги — только пустые отчёты с ошибкой.
+if [ ! -x "${APP_DIR}/xray" ]; then
+  c_g "→ ставим xray-core в ${APP_DIR}/xray…"
+  ARCH="$(uname -m)"
+  case "${ARCH}" in
+    arm64|aarch64) ZIP_NAME="Xray-macos-arm64-v8a.zip" ;;
+    x86_64|amd64)  ZIP_NAME="Xray-macos-64.zip" ;;
+    *) die "неизвестная архитектура macOS: ${ARCH}. Поставь xray вручную: брось бинарь в ${APP_DIR}/xray" ;;
+  esac
+  XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/${ZIP_NAME}"
+  TMP="$(mktemp -d)"
+  if curl -fL --retry 2 "${XRAY_URL}" -o "${TMP}/xray.zip"; then
+    if unzip -oq "${TMP}/xray.zip" xray -d "${APP_DIR}" 2>/dev/null; then
+      chmod +x "${APP_DIR}/xray"
+      # macOS Gatekeeper — снимаем quarantine, иначе LaunchAgent не запустит.
+      xattr -dr com.apple.quarantine "${APP_DIR}/xray" 2>/dev/null || true
+      echo "  ✓ xray установлен ($("${APP_DIR}/xray" version 2>/dev/null | head -1 || echo 'версия неизвестна'))"
+    else
+      c_y "не удалось распаковать ${ZIP_NAME}. Поставь xray вручную в ${APP_DIR}/xray"
+    fi
+  else
+    c_y "не удалось скачать ${XRAY_URL}. Поставь xray вручную в ${APP_DIR}/xray"
+  fi
+  rm -rf "${TMP}"
+fi
+
 # Положим symlink в /usr/local/bin, если есть права. Иначе подскажем как.
 if [ -w /usr/local/bin ] 2>/dev/null; then
   ln -sf "${APP_DIR}/monitorvpn" /usr/local/bin/monitorvpn

@@ -1,43 +1,59 @@
 #!/usr/bin/env python3
 """
-xray-checker-statuspage probe agent (TLS handshake, MVP)
+xray-checker-statuspage probe agent (xray-core)
 
 Что делает:
-  1. Раз в INTERVAL секунд тянет список таргетов с сервера статус-страницы
-     (GET /api/probe/targets под X-Probe-Token) — сервер сам парсит
-     подписку и отдаёт уже разобранные {name, host, port, sni}.
-  2. Для каждого таргета делает TCP+TLS handshake к host:port с правильным SNI.
-  3. Отправляет результаты на STATUSPAGE_URL/api/probe/report.
+  1. Раз в INTERVAL секунд проверяет свою геолокацию (ifconfig.co/country-iso).
+     Если geo != EXPECT_COUNTRY → на устройстве включён VPN, пробы через туннель
+     бессмысленны — шлёт серверу {vpn:true,results:[]} и пропускает цикл.
+  2. Иначе тянет список таргетов с сервера (GET /api/probe/targets под
+     X-Probe-Token) — сервер сам парсит подписку и отдаёт разобранные
+     {name, host, port, sni, uuid, security, pbk, sid, fp, flow, type, ...}.
+  3. Для каждого таргета поднимает xray-core с outbound из этого таргета и
+     локальным HTTP-inbound. Через прокси дёргает http://cp.cloudflare.com/
+     cdn-cgi/trace. Если в ответе есть cloudflare-маркер «fl=» — туннель работает.
+     После каждого теста xray-core тушится.
+  4. Отправляет результаты на STATUSPAGE_URL/api/probe/report.
 
-Почему агент НЕ тянет подписку напрямую: подписка обычно лежит за VPN,
-агенту в зоне блокировки она не доступна без туннеля. Сервер в облаке
-тянет её и отдаёт уже распарсенной. Бонусом — секретный URL подписки не
-светится на устройстве пользователя.
+Почему именно xray-core, а не «свой» TLS-handshake:
+- REALITY-сервер при невалидном клиенте делает fallback на легитимный dest
+  (microsoft.com и т.п.). TLS handshake пройдёт успешно — UI покажет «ok»,
+  хотя реального туннеля нет.
+- Python `ssl` использует свой fingerprint, не тот, что указан в `fp=` строки
+  подписки. DPI, рубящий конкретный fingerprint, пропустит наши пакеты.
+- xray-core применяет ровно тот fp/pbk/sid/flow, что в подписке, и проверяет
+  туннель целиком — это единственный честный probe.
 
-В начале каждого цикла проверяет свою геолокацию (ifconfig.co/country-iso).
-Если страна не совпадает с EXPECT_COUNTRY, в лог пишется warning — но
-репорт всё равно уходит (только с пометкой `geo` для UI).
+Почему агент НЕ тянет подписку напрямую: подписка обычно лежит за VPN, агенту
+в зоне блокировки она не доступна. Сервер в облаке тянет её и отдаёт уже
+распарсенной. Бонус — секретный URL подписки не светится на устройстве.
 
 Конфиг — через переменные окружения:
   STATUSPAGE_URL     обязательно   куда репортить (https://status.example.com)
   PROBE_TOKEN        обязательно   токен пробника (выдаётся при регистрации)
   INTERVAL           60            секунды между циклами
-  TIMEOUT            10            таймаут TCP+TLS handshake (сек)
+  TIMEOUT            10            таймаут одного теста (старт xray + HTTP)
   EXPECT_COUNTRY     RU            ожидаемая страна пробника
   GEO_CHECK_URL      https://ifconfig.co/country-iso
+  XRAY_BIN           — явный путь к бинарю xray-core; если пусто, ищет в
+                     ~/.xrs-probe/xray[.exe], потом в PATH.
+  PROBE_TEST_URL     http://cp.cloudflare.com/cdn-cgi/trace
+  PROBE_TEST_MARKER  fl=            подстрока, которая должна быть в ответе
 
 Запуск:
   STATUSPAGE_URL=https://... PROBE_TOKEN=... python3 agent.py
 """
 import json
 import os
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
-import uuid as _uuid
 
 STATUSPAGE_URL = os.environ.get("STATUSPAGE_URL", "").rstrip("/")
 PROBE_TOKEN = os.environ.get("PROBE_TOKEN", "").strip()
@@ -45,7 +61,11 @@ INTERVAL = int(os.environ.get("INTERVAL", "60"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "10"))
 EXPECT_COUNTRY = os.environ.get("EXPECT_COUNTRY", "RU").strip().upper()
 GEO_CHECK_URL = os.environ.get("GEO_CHECK_URL", "https://ifconfig.co/country-iso")
-USER_AGENT = "xrs-probe/0.1 (+macos)"
+XRAY_BIN_ENV = os.environ.get("XRAY_BIN", "").strip()
+PROBE_TEST_URL = os.environ.get("PROBE_TEST_URL",
+                                "http://cp.cloudflare.com/cdn-cgi/trace")
+PROBE_TEST_MARKER = os.environ.get("PROBE_TEST_MARKER", "fl=")
+USER_AGENT = "xrs-probe/0.2"
 
 
 def log(*a):
@@ -109,139 +129,179 @@ def fetch_targets():
             % (STATUSPAGE_URL, e.reason))
 
 
-def _open_tls(host, port, sni):
-    """Открывает TLS-соединение к host:port с указанным SNI. Возвращает
-    (sock, rtt_ms) или бросает исключение."""
-    t0 = time.monotonic()
-    sock = socket.create_connection((host, port), timeout=TIMEOUT)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        ctx.set_alpn_protocols(["h2", "http/1.1"])
-    except (NotImplementedError, AttributeError):
-        pass
-    tls = ctx.wrap_socket(sock, server_hostname=sni)
-    rtt = int((time.monotonic() - t0) * 1000)
-    return tls, rtt
+def _find_xray():
+    """Бинарь xray-core: явный XRAY_BIN > ~/.xrs-probe/xray[.exe] > PATH."""
+    if XRAY_BIN_ENV and os.path.isfile(XRAY_BIN_ENV):
+        return XRAY_BIN_ENV
+    home = os.path.expanduser("~")
+    name = "xray.exe" if os.name == "nt" else "xray"
+    local = os.path.join(home, ".xrs-probe", name)
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return shutil.which("xray") or shutil.which(name) or ""
 
 
-def _build_vless_request(uuid_str, dest_host="www.cloudflare.com",
-                         dest_port=443):
-    """Минимальный VLESS-request (без addons).
-    Структура:
-      version(1) | UUID(16) | addonsLen(1) | command(1) | port(2 BE) |
-      addrType(1=ipv4|2=domain|3=ipv6) | addr(N).
-    """
-    uuid_bytes = _uuid.UUID(uuid_str).bytes
-    return (b"\x00" + uuid_bytes + b"\x00"          # version + UUID + no addons
-            + b"\x01"                                # command: TCP
-            + int(dest_port).to_bytes(2, "big")
-            + b"\x02"                                # address type: domain
-            + len(dest_host).to_bytes(1, "big")
-            + dest_host.encode("ascii"))
+def _free_port():
+    """Случайный свободный TCP-порт на 127.0.0.1."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
 
 
-def tls_probe(host, port, sni):
-    """Только TCP+TLS handshake. Для REALITY этого недостаточно (любой клиент
-    проходит handshake — REALITY-fallback прокидывает «чужих» на безопасный
-    домен). Используется как fallback когда нет UUID."""
-    sock = None
-    try:
-        sock, rtt = _open_tls(host, port, sni)
+def _wait_port(port, timeout):
+    """Ждёт пока порт начнёт принимать соединения. True/False."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
-            sock.close()
-        except Exception:
-            pass
-        return True, rtt, ""
-    except Exception as e:
-        try:
-            if sock:
-                sock.close()
-        except Exception:
-            pass
-        return False, 0, type(e).__name__ + ": " + str(e)[:160]
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
 
 
-def vless_probe(host, port, sni, uuid_str, security="tls"):
-    """TCP+TLS handshake + VLESS-handshake с UUID + HTTP-ping через туннель.
-    Это валидирует конкретный конфиг (UUID/pbk/shortId), а не только TLS-
-    достижимость хоста.
+def _stream_settings(t):
+    """streamSettings для outbound — собираем по полям таргета."""
+    net = (t.get("type") or "tcp").lower()
+    sec = (t.get("security") or "").lower() or "none"
+    ss = {"network": net, "security": sec}
+    sni = t.get("sni") or t.get("host")
+    fp = t.get("fp") or "chrome"
+    if sec == "reality":
+        ss["realitySettings"] = {
+            "serverName": sni,
+            "fingerprint": fp,
+            "publicKey": t.get("pbk") or "",
+            "shortId": t.get("sid") or "",
+            "spiderX": "/",
+        }
+    elif sec == "tls":
+        tls_cfg = {"serverName": sni, "fingerprint": fp,
+                   "allowInsecure": False}
+        alpn = (t.get("alpn") or "").strip()
+        if alpn:
+            tls_cfg["alpn"] = [a.strip() for a in alpn.split(",") if a.strip()]
+        ss["tlsSettings"] = tls_cfg
+    if net == "ws":
+        ss["wsSettings"] = {
+            "path": t.get("path") or "/",
+            "headers": {"Host": t.get("host_header") or sni},
+        }
+    elif net == "grpc":
+        ss["grpcSettings"] = {"serviceName": t.get("service_name") or ""}
+    elif net == "tcp" and (t.get("header_type") or "") == "http":
+        ss["tcpSettings"] = {"header": {
+            "type": "http",
+            "request": {
+                "path": [t.get("path") or "/"],
+                "headers": {"Host": [t.get("host_header") or sni]},
+            },
+        }}
+    return ss
 
-    Sequence:
-      1. TLS handshake к host:port с SNI.
-      2. Шлём VLESS-request (UUID + target cp.cloudflare.com:80) и сразу
-         HTTP/1.0 GET через туннель.
-      3. Читаем response. Должно быть:
-         - первые 2 байта: VLESS-response (0x00 0x00 = version + no addons),
-         - дальше где-то "HTTP/" — значит туннель действительно прокинул нас
-           на cloudflare и оттуда вернулся HTTP-ответ.
-      4. Если VLESS-response отсутствует или после него нет HTTP-данных —
-         сервер не туннелирует (UUID битый, REALITY-fallback и т.д.).
 
-    Cloudflare возвращает H2-фреймы (например, GOAWAY начинается с 0x00 0x00),
-    которые случайно совпадают с VLESS-response — поэтому проверка HTTP-маркера
-    обязательна, недостаточно только 2 байт.
-    """
-    if not uuid_str:
-        return tls_probe(host, port, sni)
-    t0 = time.monotonic()
-    sock = None
+def _build_xray_config(t, http_port):
+    """xray-конфиг: один HTTP-inbound на 127.0.0.1:http_port + один outbound
+    из таргета. Через этот inbound HTTP-клиент попадает в туннель."""
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "in",
+            "listen": "127.0.0.1",
+            "port": http_port,
+            "protocol": "http",
+            "settings": {"timeout": 60},
+        }],
+        "outbounds": [{
+            "tag": "out",
+            "protocol": "vless",
+            "settings": {"vnext": [{
+                "address": t["host"],
+                "port": int(t["port"]),
+                "users": [{
+                    "id": t["uuid"],
+                    "encryption": "none",
+                    "flow": t.get("flow") or "",
+                }],
+            }]},
+            "streamSettings": _stream_settings(t),
+        }],
+    }
+
+
+def xray_probe(xray_bin, t):
+    """Запускает xray-core с конфигом одного таргета, дёргает PROBE_TEST_URL
+    через локальный HTTP-proxy. ok=True если в ответе есть PROBE_TEST_MARKER.
+    После теста процесс гасится."""
+    if not (t.get("uuid") and t.get("host")):
+        return False, 0, "bad target"
+    port = _free_port()
+    cfg = _build_xray_config(t, port)
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    proc = None
     try:
-        sock, _ = _open_tls(host, port, sni)
-        sock.settimeout(min(TIMEOUT, 5.0))
+        json.dump(cfg, tmp); tmp.close()
+        t0 = time.monotonic()
         try:
-            req = _build_vless_request(uuid_str, "cp.cloudflare.com", 80)
-        except (ValueError, TypeError) as e:
-            return False, 0, "Bad UUID: " + str(e)[:80]
-        # Шлём VLESS-handshake + HTTP-запрос (через туннель) одним сокетом.
-        http_req = (b"GET /cdn-cgi/trace HTTP/1.0\r\n"
-                    b"Host: cp.cloudflare.com\r\n"
-                    b"User-Agent: xrs-probe\r\n\r\n")
-        sock.sendall(req + http_req)
-        # Читаем до 4 KB, ищем HTTP-маркер или таймаут.
-        buf = b""
-        deadline = time.monotonic() + min(TIMEOUT, 6.0)
-        while time.monotonic() < deadline and len(buf) < 4096:
+            proc = subprocess.Popen(
+                [xray_bin, "run", "-c", tmp.name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
+        except (FileNotFoundError, PermissionError) as e:
+            return False, 0, "xray-core run failed: " + str(e)[:120]
+        if not _wait_port(port, timeout=min(TIMEOUT, 3.0)):
+            # xray не поднялся → читаем stderr для диагностики.
+            stderr_tail = b""
             try:
-                chunk = sock.recv(4096 - len(buf))
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            if b"HTTP/1." in buf:
-                break
-        rtt = int((time.monotonic() - t0) * 1000)
-        if not buf:
-            tag = "REALITY fallback или auth fail" if security == "reality" \
-                  else "EOF после VLESS-handshake"
-            return False, 0, tag
-        # Должны увидеть VLESS-response (0x00 0x00) + HTTP-ответ от cloudflare.
-        if len(buf) < 2 or buf[0] != 0x00 or buf[1] != 0x00:
-            return False, 0, "no VLESS response: " + buf[:24].hex()
-        if b"HTTP/1." not in buf[2:]:
-            # VLESS-handshake вроде принят, но туннель не прошёл к cloudflare.
-            # Скорее всего REALITY-fallback который случайно начал ответ с
-            # 00 00 (H2 frame header) — и при этом HTTP не виден.
-            return False, 0, "VLESS-handshake принят, но туннель не работает"
-        return True, rtt, ""
-    except (socket.timeout, ssl.SSLError, ConnectionResetError,
-            ConnectionRefusedError, OSError) as e:
-        return False, 0, type(e).__name__ + ": " + str(e)[:160]
-    except Exception as e:
-        return False, 0, "Exception: " + str(e)[:160]
-    finally:
+                proc.terminate()
+                stderr_tail = (proc.stderr.read(400) if proc.stderr else b"")
+            except Exception:
+                pass
+            err_msg = stderr_tail.decode("utf-8", "ignore").strip()[:160] \
+                      or "xray не открыл прокси-порт (проверь конфиг)"
+            return False, 0, err_msg
         try:
-            if sock:
-                sock.close()
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({
+                    "http": "http://127.0.0.1:%d" % port,
+                    "https": "http://127.0.0.1:%d" % port,
+                }))
+            req = urllib.request.Request(
+                PROBE_TEST_URL, headers={"User-Agent": USER_AGENT})
+            r = opener.open(req, timeout=min(TIMEOUT, 8.0))
+            body = r.read(2048).decode("utf-8", "ignore")
+            rtt = int((time.monotonic() - t0) * 1000)
+            if PROBE_TEST_MARKER in body:
+                return True, rtt, ""
+            return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
+        except urllib.error.URLError as e:
+            return False, 0, "туннель: " + str(e.reason)[:140]
+        except (socket.timeout, OSError) as e:
+            return False, 0, type(e).__name__ + ": " + str(e)[:140]
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+        try:
+            os.unlink(tmp.name)
         except Exception:
             pass
 
 
-def report(geo, results):
-    body = json.dumps({"geo": geo.lower(), "results": results},
-                      ensure_ascii=False).encode("utf-8")
+def report(geo, results, vpn=False):
+    payload = {"geo": geo.lower(), "results": results}
+    if vpn:
+        # Серверу сигналим, что цикл пропущен из-за активного VPN — он
+        # запишет VPN-период, а на графике эти минуты будут отмечены серым.
+        payload["vpn"] = True
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         STATUSPAGE_URL + "/api/probe/report",
         data=body, method="POST",
@@ -256,15 +316,18 @@ def report(geo, results):
 
 def one_cycle():
     geo = fetch_geo()
-    # VPN-страж: если geo определилось и НЕ совпадает с EXPECT_COUNTRY —
-    # на устройстве с большой вероятностью включён VPN, пробы пойдут через
-    # туннель и дадут искажённую картину. Не отправляем такой цикл вообще.
-    # Если geo не определилось (timeout/ошибка ifconfig.co) — отправляем как
-    # обычно, доверяем пользователю (иначе при первых сбоях сети пробник
-    # вообще ничего не пришлёт).
+    # VPN-страж: если geo определилось и НЕ совпадает с EXPECT_COUNTRY — на
+    # устройстве включён VPN. Пробы через туннель бессмысленны (получим
+    # ложное «всё работает»), поэтому НЕ запускаем их. Но отчёт всё равно
+    # шлём — с пометкой vpn=true: сервер запишет это как VPN-период и на
+    # графике эти минуты будут серыми, а не «нет данных».
     if EXPECT_COUNTRY and geo and geo != EXPECT_COUNTRY:
-        log("VPN detected: geo=%s, ожидалось %s — цикл пропущен, отчёт не отправлен"
+        log("VPN detected: geo=%s, ожидалось %s — отмечаем VPN-период, пробы пропущены"
             % (geo, EXPECT_COUNTRY))
+        try:
+            report(geo, [], vpn=True)
+        except Exception as e:
+            err("vpn-mark report failed:", e)
         return
     try:
         targets = fetch_targets()
@@ -274,23 +337,29 @@ def one_cycle():
     if not targets:
         err("сервер вернул пустой список таргетов")
         return
+    xray_bin = _find_xray()
+    if not xray_bin:
+        err("xray-core не найден. Поставь бинарь в ~/.xrs-probe/xray "
+            "(на Windows xray.exe) или укажи XRAY_BIN=/path/to/xray. "
+            "Без него агент не может валидировать конфиги.")
+        # Шлём пустой отчёт с явной ошибкой по каждому таргету, чтобы UI
+        # не молчал, а админ увидел проблему.
+        results = [{"name": t.get("name") or t.get("host") or "?", "ok": False,
+                    "rtt": 0, "err": "xray-core not found on probe device"}
+                   for t in targets]
+        try:
+            report(geo, results)
+        except Exception as e:
+            err("report failed:", e)
+        return
     results = []
     n_ok = 0
     for t in targets:
-        host = t.get("host"); port = int(t.get("port") or 443)
-        sni = t.get("sni") or host; name = t.get("name") or host
-        uuid_str = (t.get("uuid") or "").strip()
-        security = (t.get("security") or "").lower()
-        if not host:
-            continue
-        # Если есть UUID — делаем полный VLESS-handshake (валидирует конфиг,
-        # а не просто достижимость хоста). REALITY-fallback так отсеется.
-        # Если UUID не передан (старый сервер без обновлённого парсера) —
-        # фоллбек на TLS-only.
-        if uuid_str:
-            ok, rtt, errmsg = vless_probe(host, port, sni, uuid_str, security)
-        else:
-            ok, rtt, errmsg = tls_probe(host, port, sni)
+        name = t.get("name") or t.get("host") or "?"
+        try:
+            ok, rtt, errmsg = xray_probe(xray_bin, t)
+        except Exception as e:
+            ok, rtt, errmsg = False, 0, "probe crash: " + str(e)[:140]
         if ok:
             n_ok += 1
         results.append({"name": name, "ok": ok, "rtt": rtt, "err": errmsg})

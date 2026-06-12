@@ -145,6 +145,36 @@ if (Test-Path $monitorSrc) {
     }
 }
 
+# xray-core: качаем последний релиз github.com/XTLS/Xray-core под архитектуру.
+# Без него агент не сможет валидировать конфиги — только пустые отчёты с ошибкой.
+$XrayPath = Join-Path $AppDir 'xray.exe'
+if (-not (Test-Path $XrayPath)) {
+    Write-G '→ ставим xray-core…'
+    $arch = if ([Environment]::Is64BitOperatingSystem) {
+        if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') {
+            'Xray-windows-arm64-v8a.zip'
+        } else { 'Xray-windows-64.zip' }
+    } else { 'Xray-windows-32.zip' }
+    $xrayUrl = "https://github.com/XTLS/Xray-core/releases/latest/download/$arch"
+    $tmpZip = Join-Path $env:TEMP "xray-$([System.IO.Path]::GetRandomFileName()).zip"
+    $tmpDir = Join-Path $env:TEMP "xray-$([System.IO.Path]::GetRandomFileName())"
+    try {
+        Invoke-WebRequest -Uri $xrayUrl -OutFile $tmpZip -UseBasicParsing
+        Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+        $exe = Get-ChildItem -Path $tmpDir -Recurse -Filter 'xray.exe' | Select-Object -First 1
+        if ($exe) {
+            Copy-Item -Force $exe.FullName $XrayPath
+            Write-Host "  ✓ xray.exe установлен"
+        } else {
+            Write-Y "не нашёл xray.exe в архиве $arch. Поставь вручную в $XrayPath"
+        }
+    } catch {
+        Write-Y "не удалось скачать xray-core ($($_.Exception.Message)). Поставь вручную в $XrayPath"
+    } finally {
+        Remove-Item -Force -Recurse -ErrorAction SilentlyContinue $tmpZip, $tmpDir
+    }
+}
+
 # Конфиг с env-переменными. Хранится с правами текущего пользователя.
 $configContent = @"
 STATUSPAGE_URL=$StatuspageUrl
