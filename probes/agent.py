@@ -87,6 +87,29 @@ def http_get(url, timeout=10, insecure=False):
         return r.read()
 
 
+def _parse_trace_ip(body):
+    """Парсит поле 'ip=' из ответа cloudflare /cdn-cgi/trace."""
+    for line in body.splitlines():
+        if line.startswith("ip="):
+            return line[3:].strip()
+    return ""
+
+
+def fetch_direct_ip():
+    """Прямой IP без туннеля — baseline для сравнения с probe-ip.
+    Если probe через xray вернёт тот же ip — туннель не использовался
+    (xray мог упасть в direct fallback, или DPI пропустил голый запрос)."""
+    try:
+        req = urllib.request.Request(PROBE_TEST_URL,
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            body = r.read(2048).decode("utf-8", "ignore")
+        return _parse_trace_ip(body)
+    except Exception as e:
+        err("direct-ip probe failed: %s" % str(e)[:120])
+        return ""
+
+
 def fetch_geo():
     """Возвращает двухбуквенный код страны нашего IP (e.g. 'RU') или '' если не удалось.
     На macOS без установленных CA-сертификатов системный TLS-verify падает —
@@ -279,10 +302,11 @@ def _build_xray_config(t, http_port):
     }
 
 
-def xray_probe(xray_bin, t):
+def xray_probe(xray_bin, t, direct_ip=""):
     """Запускает xray-core с конфигом одного таргета, дёргает PROBE_TEST_URL
-    через локальный HTTP-proxy. ok=True если в ответе есть PROBE_TEST_MARKER.
-    После теста процесс гасится."""
+    через локальный HTTP-proxy. ok=True если в ответе есть PROBE_TEST_MARKER
+    И поле ip= отличается от direct_ip (т.е. трафик реально пошёл через VPN,
+    а не через direct fallback). После теста процесс гасится."""
     if not (t.get("uuid") and t.get("host")):
         return False, 0, "bad target"
     port = _free_port()
@@ -366,9 +390,16 @@ def xray_probe(xray_bin, t):
             r = opener.open(req, timeout=min(TIMEOUT, 8.0))
             body = r.read(2048).decode("utf-8", "ignore")
             rtt = int((time.monotonic() - t0) * 1000)
-            if PROBE_TEST_MARKER in body:
-                return True, rtt, ""
-            return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
+            if PROBE_TEST_MARKER not in body:
+                return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
+            # Проверяем что трафик реально шёл через туннель — IP должен
+            # отличаться от прямого. Если совпадает, значит xray молча упал
+            # в direct (или DPI пропустил голый запрос, а сервер недоступен).
+            tunnel_ip = _parse_trace_ip(body)
+            if direct_ip and tunnel_ip and tunnel_ip == direct_ip:
+                return False, 0, ("туннель не использовался: ip совпадает "
+                                  "с прямым (%s)" % tunnel_ip)
+            return True, rtt, ""
         except urllib.error.URLError as e:
             # Туннель не открылся — внутри xray может быть лог почему.
             _dump_xray_io("xray probe URLError")
@@ -460,13 +491,15 @@ def one_cycle():
         except Exception as e:
             err("report failed:", e)
         return
-    log("targets=%d, xray=%s" % (len(targets), _xray_checked["ver"] or "?"))
+    direct_ip = fetch_direct_ip()
+    log("targets=%d, xray=%s, direct_ip=%s"
+        % (len(targets), _xray_checked["ver"] or "?", direct_ip or "?"))
     results = []
     n_ok = 0
     for t in targets:
         name = t.get("name") or t.get("host") or "?"
         try:
-            ok, rtt, errmsg = xray_probe(xray_bin, t)
+            ok, rtt, errmsg = xray_probe(xray_bin, t, direct_ip)
         except Exception as e:
             ok, rtt, errmsg = False, 0, "probe crash: " + str(e)[:140]
         if ok:
