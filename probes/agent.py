@@ -141,6 +141,45 @@ def _find_xray():
     return shutil.which("xray") or shutil.which(name) or ""
 
 
+_xray_checked = {"bin": "", "ok": False, "ver": ""}
+
+
+def _check_xray_health(xray_bin):
+    """Один раз за процесс проверяем что бинарь действительно запускается.
+    Если упадёт здесь — никаких proba не делаем (всё равно ничего не выйдет)."""
+    if _xray_checked["bin"] == xray_bin:
+        return _xray_checked["ok"]
+    _xray_checked["bin"] = xray_bin
+    _xray_checked["ok"] = False
+    _xray_checked["ver"] = ""
+    log("xray check: bin=%s, exists=%s, executable=%s"
+        % (xray_bin, os.path.isfile(xray_bin), os.access(xray_bin, os.X_OK)))
+    try:
+        r = subprocess.run([xray_bin, "version"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=5)
+        out = (r.stdout or b"").decode("utf-8", "ignore").strip()
+        errtxt = (r.stderr or b"").decode("utf-8", "ignore").strip()
+        log("xray version rc=%d stdout=%r stderr=%r"
+            % (r.returncode, out[:200], errtxt[:200]))
+        if r.returncode == 0 and out:
+            _xray_checked["ok"] = True
+            _xray_checked["ver"] = out.splitlines()[0][:120]
+            return True
+        err("xray version exited with rc=%d (см. лог выше)" % r.returncode)
+    except subprocess.TimeoutExpired:
+        err("xray version timeout — бинарь подвис")
+    except FileNotFoundError as e:
+        err("xray бинарь не найден при запуске: %s" % e)
+    except PermissionError as e:
+        err("xray бинарь не исполняемый: %s" % e)
+    except OSError as e:
+        # macOS: Errno 86 «Bad CPU type in executable» = не та архитектура.
+        # Errno 13 = permission. Errno 8 = Exec format error.
+        err("xray бинарь не запускается (OSError %s): %s" % (e.errno, e))
+    return False
+
+
 def _free_port():
     """Случайный свободный TCP-порт на 127.0.0.1."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -150,17 +189,23 @@ def _free_port():
     return p
 
 
-def _wait_port(port, timeout):
-    """Ждёт пока порт начнёт принимать соединения. True/False."""
-    deadline = time.monotonic() + timeout
+def _wait_port_or_exit(proc, port, timeout):
+    """Ждёт пока порт начнёт принимать соединения ИЛИ пока процесс не завершится
+    (что бывает раньше). Возвращает ('ok'|'exited'|'timeout', elapsed_ms).
+    Если процесс exited — _wait не тратит время впустую."""
+    t0 = time.monotonic()
+    deadline = t0 + timeout
     while time.monotonic() < deadline:
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            return "exited", int((time.monotonic() - t0) * 1000)
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=0.3)
             s.close()
-            return True
+            return "ok", int((time.monotonic() - t0) * 1000)
         except OSError:
             time.sleep(0.1)
-    return False
+    return "timeout", int((time.monotonic() - t0) * 1000)
 
 
 def _stream_settings(t):
@@ -242,46 +287,74 @@ def xray_probe(xray_bin, t):
         return False, 0, "bad target"
     port = _free_port()
     cfg = _build_xray_config(t, port)
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-    # stderr xray-core → отдельный файл: PIPE+read блокирует, а нам нужно
-    # уметь читать stderr в любой момент (для диагностики).
-    err_log = tempfile.NamedTemporaryFile("w+b", suffix=".log", delete=False)
+    cfg_tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    # stdout/stderr xray-core → отдельные файлы (PIPE.read блокирует
+    # неконтролируемо, а нам надо читать в любой момент).
+    out_log = tempfile.NamedTemporaryFile("w+b", suffix=".out", delete=False)
+    err_log = tempfile.NamedTemporaryFile("w+b", suffix=".err", delete=False)
     proc = None
+    tname = (t.get("name") or t.get("host") or "?")[:60]
 
-    def _read_stderr():
+    def _read_log(f):
         try:
-            err_log.flush(); err_log.seek(0)
-            return err_log.read().decode("utf-8", "ignore").strip()
+            f.flush(); f.seek(0)
+            return f.read().decode("utf-8", "ignore").strip()
         except Exception:
             return ""
 
+    def _dump_xray_io(prefix):
+        out_text = _read_log(out_log)
+        err_text = _read_log(err_log)
+        if out_text:
+            err("%s [stdout/%s]: %s" % (prefix, tname, out_text[:800]))
+        if err_text:
+            err("%s [stderr/%s]: %s" % (prefix, tname, err_text[:800]))
+        if not out_text and not err_text:
+            err("%s [silent/%s]: xray не написал НИЧЕГО в stdout/stderr"
+                % (prefix, tname))
+        return out_text, err_text
+
     try:
-        json.dump(cfg, tmp); tmp.close()
+        json.dump(cfg, cfg_tmp); cfg_tmp.close()
+        if os.environ.get("XRAY_DEBUG") == "1":
+            # Сохраняем конфиг в HOME, чтобы можно было запустить xray вручную.
+            dbg_path = os.path.expanduser("~/.xrs-probe/last-xray-config.json")
+            try:
+                with open(dbg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                err("debug: конфиг сохранён в %s" % dbg_path)
+            except Exception:
+                pass
         t0 = time.monotonic()
         try:
             proc = subprocess.Popen(
-                [xray_bin, "run", "-c", tmp.name],
-                stdout=subprocess.DEVNULL,
+                [xray_bin, "run", "-c", cfg_tmp.name],
+                stdout=out_log,
                 stderr=err_log)
-        except (FileNotFoundError, PermissionError) as e:
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            err("xray Popen failed (%s/%s): %s"
+                % (type(e).__name__, getattr(e, "errno", "?"), e))
             return False, 0, "xray run failed: " + str(e)[:120]
-        if not _wait_port(port, timeout=min(TIMEOUT, 3.0)):
-            # xray не поднялся (или упал). Читаем stderr — там реальная
-            # причина (битый конфиг, отсутствующий ключ REALITY, etc.).
+        status, elapsed = _wait_port_or_exit(proc, port, timeout=min(TIMEOUT, 3.0))
+        if status != "ok":
+            rc = proc.poll() if proc else None
+            # Подождём ещё чуть-чуть, чтобы xray дописал ошибку.
             try:
                 proc.terminate(); proc.wait(timeout=1.5)
             except Exception:
                 pass
-            time.sleep(0.2)  # дать xray дописать сообщения об ошибке
-            stderr_text = _read_stderr()
-            # В лог агента — полный stderr, в err отчёта — последняя строка.
-            if stderr_text:
-                err("xray stderr (target=%s): %s"
-                    % (t.get("name") or t.get("host"), stderr_text[:800]))
-                last_line = stderr_text.strip().splitlines()[-1].strip()
-                return False, 0, last_line[:200] or "xray exited без сообщения"
-            return False, 0, ("xray не открыл прокси-порт за 3с "
-                              "(stderr пуст; проверь права/Gatekeeper)")
+            time.sleep(0.25)
+            out_text, err_text = _dump_xray_io(
+                "xray probe FAIL status=%s elapsed=%dms rc=%s" % (status, elapsed, rc))
+            # Берём первую информативную строку для err отчёта.
+            tail = (err_text or out_text or "").strip().splitlines()
+            last_line = next((s.strip() for s in reversed(tail)
+                              if s.strip() and not s.strip().startswith("{")), "")
+            if last_line:
+                return False, 0, last_line[:200]
+            return False, 0, ("xray %s (rc=%s, %dms, без вывода — Gatekeeper? "
+                              "права? XRAY_DEBUG=1 для конфига)"
+                              % (status, rc, elapsed))
         try:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({
@@ -297,13 +370,11 @@ def xray_probe(xray_bin, t):
                 return True, rtt, ""
             return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
         except urllib.error.URLError as e:
-            # Если туннель не открылся — внутри xray может быть лог почему.
-            stderr_text = _read_stderr()
-            if stderr_text:
-                err("xray stderr во время probe (target=%s): %s"
-                    % (t.get("name") or t.get("host"), stderr_text[-400:]))
+            # Туннель не открылся — внутри xray может быть лог почему.
+            _dump_xray_io("xray probe URLError")
             return False, 0, "туннель: " + str(e.reason)[:140]
         except (socket.timeout, OSError) as e:
+            _dump_xray_io("xray probe %s" % type(e).__name__)
             return False, 0, type(e).__name__ + ": " + str(e)[:140]
     finally:
         if proc is not None:
@@ -313,13 +384,13 @@ def xray_probe(xray_bin, t):
             except Exception:
                 try: proc.kill()
                 except Exception: pass
-        try:
-            err_log.close()
-        except Exception:
-            pass
-        for fp in (tmp.name, err_log.name):
-            try: os.unlink(fp)
+        for f in (out_log, err_log):
+            try: f.close()
             except Exception: pass
+        if os.environ.get("XRAY_DEBUG") != "1":
+            for fp in (cfg_tmp.name, out_log.name, err_log.name):
+                try: os.unlink(fp)
+                except Exception: pass
 
 
 def report(geo, results, vpn=False):
@@ -369,8 +440,6 @@ def one_cycle():
         err("xray-core не найден. Поставь бинарь в ~/.xrs-probe/xray "
             "(на Windows xray.exe) или укажи XRAY_BIN=/path/to/xray. "
             "Без него агент не может валидировать конфиги.")
-        # Шлём пустой отчёт с явной ошибкой по каждому таргету, чтобы UI
-        # не молчал, а админ увидел проблему.
         results = [{"name": t.get("name") or t.get("host") or "?", "ok": False,
                     "rtt": 0, "err": "xray-core not found on probe device"}
                    for t in targets]
@@ -379,6 +448,19 @@ def one_cycle():
         except Exception as e:
             err("report failed:", e)
         return
+    if not _check_xray_health(xray_bin):
+        # Бинарь есть, но не запускается. Гасим цикл с явной ошибкой —
+        # дальнейшие probe всё равно упадут. Реальная причина в логе выше.
+        results = [{"name": t.get("name") or t.get("host") or "?", "ok": False,
+                    "rtt": 0,
+                    "err": "xray бинарь не запускается на устройстве (см. agent.log)"}
+                   for t in targets]
+        try:
+            report(geo, results)
+        except Exception as e:
+            err("report failed:", e)
+        return
+    log("targets=%d, xray=%s" % (len(targets), _xray_checked["ver"] or "?"))
     results = []
     n_ok = 0
     for t in targets:
