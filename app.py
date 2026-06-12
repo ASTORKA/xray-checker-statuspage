@@ -928,6 +928,11 @@ def build_summary():
         # Текущий статус группы для тоталов и для верхнего кружка-точки.
         any_fresh_online = any(b["fresh"] and b["online"] for b in regional)
         any_fresh = any(b["fresh"] for b in regional)
+        # «Кто-то реально тестит» — свежий пробник НЕ в VPN. VPN-пробник активен,
+        # но сервер не проверяет (через туннель пробы бессмысленны), поэтому он
+        # НЕ подтверждает ни online, ни offline. Красный/зелёный ставим только
+        # если есть такой тестирующий пробник; иначе — синий «нет подтверждения».
+        any_testing = any(b["fresh"] and not b["vpnActive"] for b in regional)
         # Текущий пинг (для лимита на странице) — берём минимальный среди свежих ok.
         cur_rtts = [b["latencyMs"] for b in regional
                     if b["fresh"] and b["online"] and b["latencyMs"] > 0]
@@ -950,6 +955,7 @@ def build_summary():
             "cc": cc,
             "online": bool(any_fresh_online),
             "anyFresh": bool(any_fresh),
+            "anyTesting": bool(any_testing),
             "latencyMs": cur_latency,
             "uptime30": up30,
             "downMin30": sum_dm,
@@ -1408,10 +1414,10 @@ function showTipServer(e,s){
   var uc=(u===null)?"var(--tx2)":(u>=99.9?"var(--ok)":(u>=99?"var(--warn)":"var(--bad)"));
   var ut=(u===null)?"нет данных":u.toFixed(2)+"%";
   var dm=(s.downMin30>0)?'<b style="color:var(--bad)">'+fmtDur(s.downMin30)+'</b>':'<b style="color:var(--ok)">0 мин</b>';
-  // Статус: нет пробников / нет свежих данных (нет подтверждения) / онлайн / офлайн.
+  // Статус: нет пробников / никто не проверяет (нет подтверждения) / онлайн / офлайн.
   var statusHtml;
   if(s.noData)statusHtml='<b style="color:var(--tx3)">нет пробников</b>';
-  else if(!s.anyFresh)statusHtml='<b style="color:#3d7bf0">нет данных (никто не проверяет)</b>';
+  else if(!s.anyTesting)statusHtml='<b style="color:#3d7bf0">нет данных (никто не проверяет)</b>';
   else if(s.online)statusHtml='<b style="color:var(--ok)">онлайн</b>';
   else statusHtml='<b style="color:var(--bad)">офлайн</b>';
   tip.innerHTML='<div class="d">'+escapeHtml(s.name)+'</div>'+
@@ -1577,12 +1583,12 @@ function applyServer(item,s,days){
   item._label._s=s;
   // Точка статуса сервера:
   //   серый  — пробников нет вообще;
-  //   синий  — пробники есть, но сейчас никто не шлёт свежие данные →
+  //   синий  — никто СЕЙЧАС реально не тестит (все либо молчат, либо в VPN) →
   //            подтверждения работает/не работает НЕТ (не значит «офлайн»);
-  //   зелёный — хотя бы один свежий пробник видит сервер онлайн;
-  //   красный — есть свежие данные, и сервер офлайн.
+  //   зелёный — хотя бы один тестирующий пробник видит сервер онлайн;
+  //   красный — есть тестирующий пробник, и он видит офлайн.
   if(s.noData){item._dot.style.background="#cfd6df";}
-  else if(!s.anyFresh){item._dot.style.background="#3d7bf0";}
+  else if(!s.anyTesting){item._dot.style.background="#3d7bf0";}
   else if(s.online){item._dot.style.background="#16b07a";}
   else{item._dot.style.background="#e8504e";}
   item._p.textContent=(s.uptime30===null)?"—":s.uptime30.toFixed(2)+"%";
