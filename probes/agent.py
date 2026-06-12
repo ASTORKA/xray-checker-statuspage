@@ -167,7 +167,8 @@ def fetch_targets():
         if e.code == 401:
             raise RuntimeError(
                 "сервер: токен пробника отвергнут. Возможно, пробника удалили — "
-                "переустанови через install-macos.sh.")
+                "переустанови агент установщиком (install-macos.sh / "
+                "install-windows.ps1).")
         raise RuntimeError("сервер ответил HTTP %d" % e.code)
     except urllib.error.URLError as e:
         raise RuntimeError(

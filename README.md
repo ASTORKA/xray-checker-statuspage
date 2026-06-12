@@ -361,7 +361,7 @@ monitorvpn delete      полностью удалить (plist + ~/.xrs-probe +
 ```powershell
 # В PowerShell (не обязательно admin — пробник работает в твоей пользовательской сессии)
 mkdir ~\xrs-probe; cd ~\xrs-probe
-curl.exe -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
+curl.exe -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
 .\install-windows.ps1
 # спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
 ```

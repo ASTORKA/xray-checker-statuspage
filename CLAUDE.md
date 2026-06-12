@@ -57,9 +57,10 @@ PROBE_SUBSCRIPTION_URL  ──┐
 | `README.md` | Док для пользователя. |
 | `CLAUDE.md` | Этот файл. |
 | `.github/workflows/docker.yml` | Сборка образа в GHCR при пуше в `main`. |
-| `probes/agent.py` | Probe-агент (TLS handshake, отчёты). |
-| `probes/install-macos.sh` | Установщик агента на macOS (LaunchAgent). |
-| `probes/monitorvpn` | CLI для управления агентом на macOS. |
+| `probes/agent.py` | Probe-агент (xray-core + burst-проверка). Кросс-платформенный. |
+| `probes/install-macos.sh` | Установщик агента на macOS (LaunchAgent + xray-core). |
+| `probes/install-windows.ps1` | Установщик агента на Windows (Scheduled Task + xray.exe). |
+| `probes/monitorvpn` / `probes/monitorvpn.ps1` | CLI управления агентом (macOS / Windows). |
 
 `install.sh` ставит Docker/nginx/HTTPS, генерирует `ADMIN_TOKEN`, пишет
 `docker-compose.yml` (узел тянет готовый образ из GHCR — без локальной сборки).
@@ -375,37 +376,64 @@ gzip (для text/json/svg), gzip, ставит `Cache-Control`, `X-Robots-Tag`,
 
 ## Probe-агент (`probes/agent.py`)
 
-Однофайловый Python (только stdlib). ENV:
+Однофайловый Python (только stdlib), **кросс-платформенный** — один и тот же
+`agent.py` на macOS/Linux/Windows. Тестит конфиги **через xray-core** (бинарь
+рядом: `~/.xrs-probe/xray[.exe]`), а не самописным TLS-handshake'ом. ENV:
 
 | Переменная | Дефолт | |
 |---|---|---|
 | `STATUSPAGE_URL` | — | куда репортить |
 | `PROBE_TOKEN` | — | выданный сервером при регистрации |
 | `INTERVAL` | `60` | период цикла, сек |
-| `TIMEOUT` | `10` | таймаут TLS handshake |
+| `TIMEOUT` | `10` | таймаут старта xray + одиночного запроса |
 | `EXPECT_COUNTRY` | `RU` | ожидаемый ISO-код страны |
-| `GEO_CHECK_URL` | `https://ifconfig.co/country-iso` | сервис для определения страны |
+| `GEO_CHECK_URL` | `https://ifconfig.co/country-iso` | сервис geo-проверки |
+| `XRAY_BIN` | — | явный путь к xray; иначе `~/.xrs-probe/xray[.exe]` → PATH |
+| `PROBE_TEST_URL` | `http://cp.cloudflare.com/cdn-cgi/trace` | этап 1: туннель жив + ip |
+| `PROBE_BULK_URL` | `https://www.youtube.com/` | этап 2 (burst): цель блокировок РФ |
+| `PROBE_BURST_COUNT` | `30` | сколько параллельных коннектов в burst |
+| `PROBE_BURST_OK_RATIO` | `0.5` | мин. доля успешных, иначе сервер «не работает» |
+| `XRAY_DEBUG` | — | `1` → сохраняет последний xray-конфиг + не удаляет stdout/stderr |
 
 Цикл (`one_cycle()`):
 
-1. `fetch_geo()` — определяет страну через `ifconfig.co/country-iso`.
-   На macOS у Python без `certifi` HTTPS-verify падает → есть fallback на
-   unverified context (geo-check не критичен для безопасности).
-2. **VPN-страж**: если geo определилось и `!= EXPECT_COUNTRY` → **цикл
-   пропускается, отчёт НЕ отправляется**. Это сделано чтобы не загрязнять
-   данные когда на устройстве пробника случайно включён VPN. Если geo не
-   определилось (timeout/ошибка ifconfig.co) — отчёт уходит, иначе при
-   первом же сбое сети пробник перестал бы работать.
-3. `fetch_targets()` — GET `STATUSPAGE_URL/api/probe/targets` с
-   `X-Probe-Token`. Сервер сам тянет подписку (PROBE_SUBSCRIPTION_URL) и
-   отдаёт разобранный список `[{name, host, port, sni}]`. Подписка с
-   устройства пользователя НЕ светится.
-4. Для каждого таргета — TCP-connect + TLS handshake к `host:port` с
-   правильным SNI. Сертификат не верифицируется (REALITY использует
-   невалидный — это норма). Если DPI обрывает на ClientHello — увидим
-   `ConnectionResetError`. IP-блок — `TimeoutError`/`refused`.
-5. `report()` — POST `STATUSPAGE_URL/api/probe/report`
-   `{geo, results: [...]}`.
+1. `fetch_geo()` — определяет страну. На macOS без `certifi` HTTPS-verify
+   падает → fallback на unverified context (geo-check не критичен).
+2. **VPN-страж**: если geo `!= EXPECT_COUNTRY` → шлёт `{vpn:true, results:[]}`
+   (а не пропускает молча) — сервер пишет VPN-период, UI красит серым.
+3. `fetch_targets()` — GET `/api/probe/targets`. Сервер отдаёт разобранный
+   список с полями для xray-outbound: `{name, host, port, sni, uuid,
+   security, pbk, sid, fp, flow, type, alpn, ...}`.
+4. `_find_xray()` + `_check_xray_health()` — раз за процесс проверяет, что
+   бинарь запускается (`xray version`). Нет/битый → отчёт с явной ошибкой по
+   каждому таргету (не молчит).
+5. `fetch_direct_ip()` — прямой IP без туннеля (baseline для сравнения).
+6. Для каждого таргета — `xray_probe()`:
+   - поднимает xray-core с inline-конфигом (`_build_xray_config`): HTTP-inbound
+     на 127.0.0.1:rand-port + vless-outbound из таргета (`_stream_settings`
+     собирает reality/tls/ws/grpc по полям);
+   - **этап 1**: одиночный GET `PROBE_TEST_URL` через прокси → проверяет
+     cloudflare-маркер `fl=` И что `ip=` отличается от `direct_ip` (иначе
+     direct fallback);
+   - **этап 2 (BURST, главный)**: `_burst_through_proxy()` открывает
+     `PROBE_BURST_COUNT` параллельных коннектов к `PROBE_BULK_URL`. **Почему
+     именно burst**: эмпирически (РФ, ТСПУ) DPI рубит REALITY-endpoint по
+     ВСПЛЕСКУ хендшейков заблокированного fingerprint — одиночный коннект
+     проходит даже на битом конфиге, пачка дохнет. Реальный клиент (Happ)
+     открывает десятки коннектов разом. Если доля успешных <
+     `PROBE_BURST_OK_RATIO` → сервер нерабочий;
+   - xray-core тушится после каждого таргета.
+7. `report()` — POST `/api/probe/report {geo, results:[...]}`.
+
+**Почему xray-core, а не самописный handshake** (важная история, не повторять
+ошибку): REALITY при невалидном клиенте делает fallback на легитимный dest —
+TLS handshake проходит, UI показывает ложный «ok». Python `ssl` шлёт свой
+fingerprint, не тот что в `fp=`. Только xray-core применяет ровно
+fp/pbk/sid/flow из подписки. **И даже этого мало** — одиночный xray-коннект
+проходит блок; ловит блок только burst (см. этап 2).
+
+**Версия xray запинена на `v25.12.8`** в установщиках и `monitorvpn xray-update`
+— 26.x ломает REALITY-конфиг (`empty "password"`). Override: env `XRAY_VERSION`.
 
 ## CLI-команды
 
@@ -448,7 +476,7 @@ monitorvpn delete      # полностью удалить
 ```powershell
 # Установка (нужен Python 3.10+, ставится через `winget install Python.Python.3.12`)
 mkdir ~\xrs-probe; cd ~\xrs-probe
-curl.exe -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
+curl.exe -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
 .\install-windows.ps1
 
 # Управление (после установки команда `monitorvpn` появится в PATH; перезайди
