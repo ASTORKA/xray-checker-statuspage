@@ -56,10 +56,22 @@ function Write-Y ([string]$msg) { Write-Host $msg -ForegroundColor Yellow }
 function Write-R ([string]$msg) { Write-Host $msg -ForegroundColor Red }
 
 function Get-PythonExe {
-    # Предпочитаем Python launcher 'py' — он умеет выбирать 3.x.
-    foreach ($cand in @('py', 'python3', 'python')) {
+    # Нужен РЕАЛЬНЫЙ python.exe, а НЕ launcher py.exe. Причина: py.exe читает
+    # shebang '#!/usr/bin/env python3' в agent.py и уходит запускать `python3`,
+    # который на многих системах — заглушка Microsoft Store («Python was not
+    # found»). python.exe shebang не читает и запускает скрипт как есть.
+    # Поэтому: находим интерпретатор, спрашиваем у него sys.executable и
+    # возвращаем именно его (отсеивая WindowsApps-заглушки).
+    foreach ($cand in @('py', 'python', 'python3')) {
         $c = Get-Command $cand -ErrorAction SilentlyContinue
-        if ($c) { return $c.Path }
+        if (-not $c) { continue }
+        if ($c.Path -like '*\WindowsApps\*') { continue }   # стор-заглушка
+        try {
+            $real = (& $c.Path -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
+        } catch { $real = $null }
+        if ($real -and (Test-Path $real) -and ($real -notlike '*\WindowsApps\*')) {
+            return $real.Trim()
+        }
     }
     return $null
 }
