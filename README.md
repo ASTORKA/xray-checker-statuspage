@@ -334,9 +334,15 @@ monitorvpn delete      полностью удалить (plist + ~/.xrs-probe +
 # В PowerShell (не обязательно admin — пробник работает в твоей пользовательской сессии)
 mkdir ~\xrs-probe; cd ~\xrs-probe
 curl.exe -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
-.\install-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 # спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
 ```
+
+> По умолчанию Windows блокирует запуск неподписанных `.ps1` (`running scripts is
+> disabled on this system`). Поэтому запускаем через `powershell -ExecutionPolicy
+> Bypass -File …` — это обходит политику **только для одного запуска**, не меняя
+> системных настроек и не требуя админа. (Альтернатива: один раз
+> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, затем `.\install-windows.ps1`.)
 
 Что происходит:
 - Регистрирует пробника на сервере (`mode=merge` — если уже был пробник с этим
@@ -348,8 +354,9 @@ curl.exe -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage
   User PATH (перезайди в PowerShell после установки).
 - Логи: `%USERPROFILE%\.xrs-probe\agent.log`.
 
-Команды `monitorvpn` те же, что на macOS. Снести: `monitorvpn delete` или
-`.\install-windows.ps1 -Uninstall`.
+Команды `monitorvpn` те же, что на macOS (обёртка `monitorvpn.cmd` уже запускает
+PowerShell с обходом политики, так что отдельно ничего указывать не нужно). Снести:
+`monitorvpn delete` или `powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Uninstall`.
 
 **Поставить пробника на Linux** (готового установщика нет, но агент — один
 кросс-платформенный `agent.py`, ставится вручную; нужен `python3` и `unzip`):
