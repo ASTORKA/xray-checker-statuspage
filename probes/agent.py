@@ -37,6 +37,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid as _uuid
 
 STATUSPAGE_URL = os.environ.get("STATUSPAGE_URL", "").rstrip("/")
 PROBE_TOKEN = os.environ.get("PROBE_TOKEN", "").strip()
@@ -108,43 +109,134 @@ def fetch_targets():
             % (STATUSPAGE_URL, e.reason))
 
 
-def tls_probe(host, port, sni):
-    """TCP+TLS handshake. Сертификат не верифицируем (REALITY/самоподписи).
-    Возвращает (ok, rtt_ms, err_str)."""
+def _open_tls(host, port, sni):
+    """Открывает TLS-соединение к host:port с указанным SNI. Возвращает
+    (sock, rtt_ms) или бросает исключение."""
     t0 = time.monotonic()
+    sock = socket.create_connection((host, port), timeout=TIMEOUT)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except (NotImplementedError, AttributeError):
+        pass
+    tls = ctx.wrap_socket(sock, server_hostname=sni)
+    rtt = int((time.monotonic() - t0) * 1000)
+    return tls, rtt
+
+
+def _build_vless_request(uuid_str, dest_host="www.cloudflare.com",
+                         dest_port=443):
+    """Минимальный VLESS-request (без addons).
+    Структура:
+      version(1) | UUID(16) | addonsLen(1) | command(1) | port(2 BE) |
+      addrType(1=ipv4|2=domain|3=ipv6) | addr(N).
+    """
+    uuid_bytes = _uuid.UUID(uuid_str).bytes
+    return (b"\x00" + uuid_bytes + b"\x00"          # version + UUID + no addons
+            + b"\x01"                                # command: TCP
+            + int(dest_port).to_bytes(2, "big")
+            + b"\x02"                                # address type: domain
+            + len(dest_host).to_bytes(1, "big")
+            + dest_host.encode("ascii"))
+
+
+def tls_probe(host, port, sni):
+    """Только TCP+TLS handshake. Для REALITY этого недостаточно (любой клиент
+    проходит handshake — REALITY-fallback прокидывает «чужих» на безопасный
+    домен). Используется как fallback когда нет UUID."""
     sock = None
     try:
-        sock = socket.create_connection((host, port), timeout=TIMEOUT)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        # ALPN h2/http1.1 — как у chrome, чтобы выглядеть стандартно
+        sock, rtt = _open_tls(host, port, sni)
         try:
-            ctx.set_alpn_protocols(["h2", "http/1.1"])
-        except (NotImplementedError, AttributeError):
-            pass
-        tls = ctx.wrap_socket(sock, server_hostname=sni)
-        rtt = int((time.monotonic() - t0) * 1000)
-        try:
-            tls.close()
+            sock.close()
         except Exception:
             pass
         return True, rtt, ""
-    except (socket.timeout, ssl.SSLError, ConnectionResetError,
-            ConnectionRefusedError, OSError) as e:
-        try:
-            if sock:
-                sock.close()
-        except Exception:
-            pass
-        return False, 0, type(e).__name__ + ": " + str(e)[:160]
     except Exception as e:
         try:
             if sock:
                 sock.close()
         except Exception:
             pass
+        return False, 0, type(e).__name__ + ": " + str(e)[:160]
+
+
+def vless_probe(host, port, sni, uuid_str, security="tls"):
+    """TCP+TLS handshake + VLESS-handshake с UUID + HTTP-ping через туннель.
+    Это валидирует конкретный конфиг (UUID/pbk/shortId), а не только TLS-
+    достижимость хоста.
+
+    Sequence:
+      1. TLS handshake к host:port с SNI.
+      2. Шлём VLESS-request (UUID + target cp.cloudflare.com:80) и сразу
+         HTTP/1.0 GET через туннель.
+      3. Читаем response. Должно быть:
+         - первые 2 байта: VLESS-response (0x00 0x00 = version + no addons),
+         - дальше где-то "HTTP/" — значит туннель действительно прокинул нас
+           на cloudflare и оттуда вернулся HTTP-ответ.
+      4. Если VLESS-response отсутствует или после него нет HTTP-данных —
+         сервер не туннелирует (UUID битый, REALITY-fallback и т.д.).
+
+    Cloudflare возвращает H2-фреймы (например, GOAWAY начинается с 0x00 0x00),
+    которые случайно совпадают с VLESS-response — поэтому проверка HTTP-маркера
+    обязательна, недостаточно только 2 байт.
+    """
+    if not uuid_str:
+        return tls_probe(host, port, sni)
+    t0 = time.monotonic()
+    sock = None
+    try:
+        sock, _ = _open_tls(host, port, sni)
+        sock.settimeout(min(TIMEOUT, 5.0))
+        try:
+            req = _build_vless_request(uuid_str, "cp.cloudflare.com", 80)
+        except (ValueError, TypeError) as e:
+            return False, 0, "Bad UUID: " + str(e)[:80]
+        # Шлём VLESS-handshake + HTTP-запрос (через туннель) одним сокетом.
+        http_req = (b"GET /cdn-cgi/trace HTTP/1.0\r\n"
+                    b"Host: cp.cloudflare.com\r\n"
+                    b"User-Agent: xrs-probe\r\n\r\n")
+        sock.sendall(req + http_req)
+        # Читаем до 4 KB, ищем HTTP-маркер или таймаут.
+        buf = b""
+        deadline = time.monotonic() + min(TIMEOUT, 6.0)
+        while time.monotonic() < deadline and len(buf) < 4096:
+            try:
+                chunk = sock.recv(4096 - len(buf))
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if b"HTTP/1." in buf:
+                break
+        rtt = int((time.monotonic() - t0) * 1000)
+        if not buf:
+            tag = "REALITY fallback или auth fail" if security == "reality" \
+                  else "EOF после VLESS-handshake"
+            return False, 0, tag
+        # Должны увидеть VLESS-response (0x00 0x00) + HTTP-ответ от cloudflare.
+        if len(buf) < 2 or buf[0] != 0x00 or buf[1] != 0x00:
+            return False, 0, "no VLESS response: " + buf[:24].hex()
+        if b"HTTP/1." not in buf[2:]:
+            # VLESS-handshake вроде принят, но туннель не прошёл к cloudflare.
+            # Скорее всего REALITY-fallback который случайно начал ответ с
+            # 00 00 (H2 frame header) — и при этом HTTP не виден.
+            return False, 0, "VLESS-handshake принят, но туннель не работает"
+        return True, rtt, ""
+    except (socket.timeout, ssl.SSLError, ConnectionResetError,
+            ConnectionRefusedError, OSError) as e:
+        return False, 0, type(e).__name__ + ": " + str(e)[:160]
+    except Exception as e:
         return False, 0, "Exception: " + str(e)[:160]
+    finally:
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
 
 
 def report(geo, results):
@@ -187,9 +279,18 @@ def one_cycle():
     for t in targets:
         host = t.get("host"); port = int(t.get("port") or 443)
         sni = t.get("sni") or host; name = t.get("name") or host
+        uuid_str = (t.get("uuid") or "").strip()
+        security = (t.get("security") or "").lower()
         if not host:
             continue
-        ok, rtt, errmsg = tls_probe(host, port, sni)
+        # Если есть UUID — делаем полный VLESS-handshake (валидирует конфиг,
+        # а не просто достижимость хоста). REALITY-fallback так отсеется.
+        # Если UUID не передан (старый сервер без обновлённого парсера) —
+        # фоллбек на TLS-only.
+        if uuid_str:
+            ok, rtt, errmsg = vless_probe(host, port, sni, uuid_str, security)
+        else:
+            ok, rtt, errmsg = tls_probe(host, port, sni)
         if ok:
             n_ok += 1
         results.append({"name": name, "ok": ok, "rtt": rtt, "err": errmsg})

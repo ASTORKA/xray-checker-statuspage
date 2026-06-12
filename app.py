@@ -282,9 +282,9 @@ _PLACEHOLDER_HOSTS = {"0.0.0.0", "127.0.0.1", "::"}
 
 
 def _parse_vless_line(line):
-    """vless://uuid@host:port?sni=...&fp=...#name → {host, port, sni, name} или None.
-    Фильтрует «заглушки» подписки (0.0.0.0 и т.п.), которые панели отдают,
-    когда не узнают клиента по User-Agent."""
+    """vless://uuid@host:port?security=...&sni=...&fp=...#name
+    → {host, port, sni, name, uuid, security} или None.
+    Фильтрует «заглушки» подписки (0.0.0.0 и т.п.) и невалидные UUID."""
     if not line.startswith("vless://"):
         return None
     try:
@@ -299,7 +299,12 @@ def _parse_vless_line(line):
         if sni in _PLACEHOLDER_HOSTS:
             sni = host
         name = unquote(p.fragment or "").strip() or host
-        return {"name": name, "host": host, "port": int(port), "sni": sni}
+        # UUID нужен для VLESS-handshake теста на пробнике.
+        uuid_str = (p.username or "").strip()
+        # security: "reality", "tls", или пусто
+        security = (q.get("security") or [""])[0].strip().lower()
+        return {"name": name, "host": host, "port": int(port),
+                "sni": sni, "uuid": uuid_str, "security": security}
     except Exception:
         return None
 
@@ -2165,6 +2170,54 @@ class Handler(BaseHTTPRequestHandler):
             probe = create_probe(name, mode=mode)
             self._send(200,
                        json.dumps({"ok": True, **probe}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/admin/refresh-all":
+            # One-shot обновление двух уровней кешей statuspage'a:
+            #   1) инвалидация кеша probe-targets + перетягивание подписки;
+            #   2) немедленный poll_once к xray-checker (новые имена попадают
+            #      в current — пробники смогут на них маппить).
+            # xray-checker — отдельный контейнер, его сам по этому эндпоинту
+            # не рестартим. Если он ещё не подтянул новую подписку:
+            #   `docker compose restart xray-checker`
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            targets_count = 0
+            targets_err = ""
+            if PROBE_SUBSCRIPTION_URL:
+                try:
+                    targets_count = len(get_probe_targets(force=True))
+                except Exception as e:
+                    targets_err = str(e)[:200]
+            poll_err = ""
+            try:
+                poll_once()
+            except Exception as e:
+                poll_err = str(e)[:200]
+            with _lock, conn() as c:
+                servers_in_current = c.execute(
+                    "SELECT COUNT(*) FROM current").fetchone()[0]
+                names = [r[0] for r in c.execute(
+                    "SELECT DISTINCT name FROM current ORDER BY name").fetchall()]
+            self._send(200,
+                       json.dumps({
+                           "ok": True,
+                           "probeTargets": {
+                               "count": targets_count,
+                               "fetchedAt": _targets_cache["ts"],
+                               "error": targets_err,
+                           },
+                           "pollOnce": {
+                               "ok": not poll_err,
+                               "error": poll_err,
+                               "serversInCurrent": servers_in_current,
+                               "names": names,
+                           },
+                           "note": ("если новых имён всё ещё не видно — "
+                                    "xray-checker ещё не обновил свою подписку. "
+                                    "На сервере: `docker compose restart xray-checker`"),
+                       }, ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path == "/api/probe/report":
             # Приём отчёта от пробника. Аутентификация — X-Probe-Token.
