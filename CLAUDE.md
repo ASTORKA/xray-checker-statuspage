@@ -60,7 +60,8 @@ PROBE_SUBSCRIPTION_URL  ──┐
 | `probes/agent.py` | Probe-агент (xray-core + burst-проверка). Кросс-платформенный. |
 | `probes/install-macos.sh` | Установщик агента на macOS (LaunchAgent + xray-core). |
 | `probes/install-windows.ps1` | Установщик агента на Windows (Scheduled Task + xray.exe). |
-| `probes/monitorvpn` / `probes/monitorvpn.ps1` | CLI управления агентом (macOS / Windows). |
+| `probes/install-linux.sh` | Установщик агента на Linux (systemd-user-сервис + xray). |
+| `probes/monitorvpn` / `.ps1` / `-linux` | CLI управления агентом (macOS / Windows / Linux). |
 
 `install.sh` ставит Docker/nginx/HTTPS, генерирует `ADMIN_TOKEN`, пишет
 `docker-compose.yml` (узел тянет готовый образ из GHCR — без локальной сборки).

@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# monitorvpn — управление probe-агентом xray-checker-statuspage на Linux
+# (systemd-user-сервис xrs-probe). Ставится install-linux.sh.
+set -euo pipefail
+
+UNIT="xrs-probe.service"
+APP_DIR="${HOME}/.xrs-probe"
+UNIT_FILE="${HOME}/.config/systemd/user/${UNIT}"
+SYMLINK="${HOME}/.local/bin/monitorvpn"
+REPO_RAW="https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes"
+AGENT_RAW_URL="${REPO_RAW}/agent.py"
+MONITORVPN_RAW_URL="${REPO_RAW}/monitorvpn-linux"
+
+c_g(){ printf "\033[32m%s\033[0m\n" "$*"; }
+c_y(){ printf "\033[33m%s\033[0m\n" "$*"; }
+c_r(){ printf "\033[31m%s\033[0m\n" "$*"; }
+
+sc(){ systemctl --user "$@"; }
+is_active(){ sc is-active --quiet "${UNIT}"; }
+
+usage(){
+  cat <<EOF
+monitorvpn — управление probe-агентом xray-checker-statuspage (Linux)
+
+Команды:
+  monitorvpn start         запустить агент
+  monitorvpn stop          остановить
+  monitorvpn restart       перезапустить
+  monitorvpn status        статус + последние строки журнала
+  monitorvpn logs          journalctl -f журнала агента
+  monitorvpn refresh       попросить сервер перечитать подписку (когда ты её обновил)
+  monitorvpn update        обновить agent.py и сам monitorvpn (без переустановки)
+  monitorvpn xray-update   скачать свежий xray-core
+  monitorvpn help          показать справку
+  monitorvpn delete        полностью удалить (unit + ~/.xrs-probe + symlink)
+EOF
+}
+
+# Читает Environment=KEY=value из unit-файла (для refresh).
+unit_env(){
+  local key="$1"
+  sed -n "s/^Environment=${key}=//p" "${UNIT_FILE}" 2>/dev/null | head -1
+}
+
+cmd="${1:-status}"
+
+case "${cmd}" in
+  start)
+    [ -f "${UNIT_FILE}" ] || { c_r "не найден ${UNIT_FILE}. Запусти install-linux.sh."; exit 1; }
+    sc start "${UNIT}" && c_g "✓ агент запущен" || { c_r "не удалось запустить"; exit 1; }
+    ;;
+  stop)
+    sc stop "${UNIT}" && c_g "✓ агент остановлен" || { c_r "не удалось остановить"; exit 1; }
+    ;;
+  restart)
+    sc restart "${UNIT}" && c_g "✓ перезапущено" || { c_r "не удалось перезапустить"; exit 1; }
+    ;;
+  status)
+    if is_active; then c_g "✓ агент работает (${UNIT})"; else c_r "✗ агент не запущен"; fi
+    echo
+    sc status "${UNIT}" --no-pager -n 0 2>/dev/null | sed -n '1,4p' || true
+    echo
+    c_y "Последние строки журнала:"
+    journalctl --user -u "${UNIT}" --no-pager -n 6 2>/dev/null || c_y "журнал недоступен"
+    ;;
+  logs|log|tail)
+    journalctl --user -u "${UNIT}" -f -n 30
+    ;;
+  refresh|reload)
+    [ -f "${UNIT_FILE}" ] || { c_r "пробник не установлен"; exit 1; }
+    URL="$(unit_env STATUSPAGE_URL)"
+    TOKEN="$(unit_env PROBE_TOKEN)"
+    [ -n "${URL}" ] && [ -n "${TOKEN}" ] || { c_r "не могу прочитать STATUSPAGE_URL/PROBE_TOKEN из unit-файла"; exit 1; }
+    c_y "запрашиваю force-refresh подписки на сервере…"
+    RESP="$(curl -fsSL -H "X-Probe-Token: ${TOKEN}" "${URL%/}/api/probe/targets?force=1" 2>&1)" \
+      || { c_r "не удалось: ${RESP}"; exit 1; }
+    echo "${RESP}" | python3 -c '
+import sys, json, datetime as dt
+d = json.load(sys.stdin)
+n = len(d.get("targets", []))
+ts = d.get("fetchedAt", 0)
+when = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
+print(f"✓ сервер вернул {n} таргетов (fetchedAt={when})")
+print("  пробник подхватит обновлённый список со следующим циклом.")
+'
+    ;;
+  update|self-update)
+    c_y "качаю свежий agent.py…"
+    if ! curl -fL --retry 2 "${AGENT_RAW_URL}" -o "${APP_DIR}/agent.py.new"; then
+      c_r "не удалось скачать agent.py"; rm -f "${APP_DIR}/agent.py.new"; exit 1
+    fi
+    if ! head -1 "${APP_DIR}/agent.py.new" | grep -q '^#!.*python'; then
+      c_r "скачанный agent.py не похож на python-скрипт (404?)"; rm -f "${APP_DIR}/agent.py.new"; exit 1
+    fi
+    mv "${APP_DIR}/agent.py.new" "${APP_DIR}/agent.py"; chmod 600 "${APP_DIR}/agent.py"
+    c_g "  ✓ agent.py обновлён"
+    c_y "качаю свежий monitorvpn…"
+    if curl -fL --retry 2 "${MONITORVPN_RAW_URL}" -o "${APP_DIR}/monitorvpn.new"; then
+      if head -1 "${APP_DIR}/monitorvpn.new" | grep -q '^#!.*bash'; then
+        mv "${APP_DIR}/monitorvpn.new" "${APP_DIR}/monitorvpn"; chmod +x "${APP_DIR}/monitorvpn"
+        c_g "  ✓ monitorvpn обновлён"
+      else
+        c_y "  ! скачанный monitorvpn невалиден — пропускаю"; rm -f "${APP_DIR}/monitorvpn.new"
+      fi
+    else
+      c_y "  ! не удалось скачать monitorvpn (не критично)"
+    fi
+    is_active && { c_y "перезапускаю агент…"; sc restart "${UNIT}"; } || true
+    c_g "✓ обновление завершено."
+    ;;
+  xray-update|update-xray)
+    ARCH="$(uname -m)"
+    case "${ARCH}" in
+      x86_64|amd64)  ZIP_NAME="Xray-linux-64.zip" ;;
+      aarch64|arm64) ZIP_NAME="Xray-linux-arm64-v8a.zip" ;;
+      armv7l|armv7)  ZIP_NAME="Xray-linux-arm32-v7a.zip" ;;
+      *) c_r "неизвестная архитектура: ${ARCH}"; exit 1 ;;
+    esac
+    XRAY_VERSION="${XRAY_VERSION:-v25.12.8}"
+    if [ "${XRAY_VERSION}" = "latest" ]; then
+      URL="https://github.com/XTLS/Xray-core/releases/latest/download/${ZIP_NAME}"
+    else
+      URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${ZIP_NAME}"
+    fi
+    TMP="$(mktemp -d)"
+    c_y "качаю ${URL}…"
+    curl -fL --retry 2 "${URL}" -o "${TMP}/xray.zip" || { c_r "не удалось скачать"; rm -rf "${TMP}"; exit 1; }
+    unzip -oq "${TMP}/xray.zip" xray -d "${APP_DIR}" || { c_r "не удалось распаковать"; rm -rf "${TMP}"; exit 1; }
+    chmod +x "${APP_DIR}/xray"; rm -rf "${TMP}"
+    c_g "✓ xray обновлён: $("${APP_DIR}/xray" version 2>/dev/null | head -1 || echo 'версия неизвестна')"
+    is_active && { c_y "перезапускаю агент…"; sc restart "${UNIT}"; } || true
+    ;;
+  delete|uninstall|rm)
+    c_y "Удаление…"
+    sc disable --now "${UNIT}" 2>/dev/null || true
+    rm -f "${UNIT_FILE}"
+    sc daemon-reload 2>/dev/null || true
+    rm -rf "${APP_DIR}"
+    rm -f "${SYMLINK}"
+    c_g "✓ удалено."
+    ;;
+  help|-h|--help|"")
+    usage
+    ;;
+  *)
+    c_r "неизвестная команда: ${cmd}"; echo; usage; exit 2
+    ;;
+esac

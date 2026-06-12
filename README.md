@@ -368,26 +368,25 @@ powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 PowerShell с обходом политики, так что отдельно ничего указывать не нужно). Снести:
 `monitorvpn delete` или `powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Uninstall`.
 
-**Поставить пробника на Linux** (готового установщика нет, но агент — один
-кросс-платформенный `agent.py`, ставится вручную; нужен `python3` и `unzip`):
+**Поставить пробника на Linux** (нужны `python3`, `unzip`, `curl` и systemd с
+пользовательской сессией; плюс `ADMIN_TOKEN` со страницы):
 
 ```bash
-# 1) Зарегистрировать пробника на сервере (ADMIN_TOKEN со страницы) → probe_token:
-TOKEN=$(curl -fsSL -X POST -H "X-Admin-Token: ВАШ_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" -d '{"name":"linux-box","mode":"merge"}' \
-  https://status.example.com/api/admin/probes | python3 -c 'import sys,json;print(json.load(sys.stdin)["probe_token"])')
-
-# 2) Скачать agent.py и xray-core (под нужную арку — amd64/arm64):
-mkdir -p ~/.xrs-probe && cd ~/.xrs-probe
-curl -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/agent.py -o agent.py
-curl -fL https://github.com/XTLS/Xray-core/releases/download/v25.12.8/Xray-linux-64.zip -o x.zip
-unzip -o x.zip xray && chmod +x xray && rm x.zip
-
-# 3) Запустить (демонизировать через systemd/tmux по вкусу):
-STATUSPAGE_URL=https://status.example.com PROBE_TOKEN=$TOKEN python3 agent.py
+mkdir -p ~/xrs-probe && cd ~/xrs-probe
+curl -fsSL https://raw.githubusercontent.com/ASTORKA/xray-checker-statuspage/main/probes/install-linux.sh -o install-linux.sh
+bash install-linux.sh
+# спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
 ```
 
-Для автозапуска заверни шаг 3 в systemd-юнит с `Restart=always`.
+Что происходит:
+- Регистрирует пробника (`mode=merge` — повторная установка переиспользует `probe_id`, история сохраняется).
+- Кладёт `agent.py` + `xray-core` (пин `v25.12.8`, под x86_64/arm64/armv7) в `~/.xrs-probe/`.
+- Создаёт **systemd-user-сервис `xrs-probe`** (`~/.config/systemd/user/`) с авто-перезапуском, ставит команду `monitorvpn` в `~/.local/bin`.
+- Пробует включить **linger** (`loginctl enable-linger`), чтобы агент работал и без активного логина (на ноутбуке после выхода из сессии). Если нет прав — подскажет `sudo loginctl enable-linger <user>`.
+
+Команды `monitorvpn` те же, что на macOS (`status`/`logs`/`restart`/`update`/…), только работают через `systemctl --user`. Логи — `journalctl --user -u xrs-probe -f`. Снести: `monitorvpn delete` или `bash install-linux.sh --uninstall`.
+
+> Если устройство без графической сессии (сервер/SSH) и `systemctl --user` недоступен — сначала `sudo loginctl enable-linger $USER`, затем запусти установщик.
 
 **Обновление подписки на сервере.** Сервер тянет подписку в момент запроса от
 пробника, кеширует на `PROBE_TARGETS_TTL_MIN` минут (по умолчанию 10). Когда
