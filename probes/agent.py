@@ -92,6 +92,13 @@ PROBE_BURST_READ_BYTES = int(os.environ.get("PROBE_BURST_READ_BYTES", "65536"))
 USER_AGENT = "xrs-probe/0.3"
 
 
+class ServerUnreachable(Exception):
+    """Не удалось достучаться до statuspage-сервера по сети (DNS/connection
+    refused/timeout). Главный кейс: после выключения VPN на устройстве у
+    Python-процесса остаётся отравленный DNS-резолвер — лечится рестартом
+    процесса (см. _self_restart в main)."""
+
+
 def log(*a):
     print("[probe]", *a, file=sys.stdout, flush=True)
 
@@ -171,7 +178,7 @@ def fetch_targets():
                 "install-windows.ps1).")
         raise RuntimeError("сервер ответил HTTP %d" % e.code)
     except urllib.error.URLError as e:
-        raise RuntimeError(
+        raise ServerUnreachable(
             "сеть: не достучаться до %s — %s. Проверь, что STATUSPAGE_URL "
             "правильный (открой в браузере — должна быть видна статус-страница)."
             % (STATUSPAGE_URL, e.reason))
@@ -514,11 +521,33 @@ def report(geo, results, vpn=False):
             "X-Probe-Token": PROBE_TOKEN,
             "User-Agent": USER_AGENT,
         })
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8", "ignore"))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError:
+        raise  # сервер ответил (просто ошибкой) — он достижим
+    except urllib.error.URLError as e:
+        raise ServerUnreachable("report: не достучаться до %s — %s"
+                                % (STATUSPAGE_URL, getattr(e, "reason", e)))
+
+
+def _try_report(geo, results):
+    """Шлёт отчёт. Возвращает True если сервер достижим (ответил, пусть и
+    ошибкой), False если сеть до сервера недоступна (триггер авто-рестарта)."""
+    try:
+        report(geo, results)
+        return True
+    except ServerUnreachable as e:
+        err("report failed:", e)
+        return False
+    except Exception as e:
+        err("report failed:", e)
+        return True
 
 
 def one_cycle():
+    """Возвращает True если в этом цикле удалось связаться со statuspage-сервером,
+    False если он недостижим по сети (на это main реагирует авто-рестартом)."""
     geo = fetch_geo()
     # VPN-страж: если geo определилось и НЕ совпадает с EXPECT_COUNTRY — на
     # устройстве включён VPN. Пробы через туннель бессмысленны (получим
@@ -530,17 +559,24 @@ def one_cycle():
             % (geo, EXPECT_COUNTRY))
         try:
             report(geo, [], vpn=True)
+            return True
+        except ServerUnreachable as e:
+            err("vpn-mark report failed:", e)
+            return False
         except Exception as e:
             err("vpn-mark report failed:", e)
-        return
+            return True
     try:
         targets = fetch_targets()
+    except ServerUnreachable as e:
+        err("targets fetch failed:", e)
+        return False
     except Exception as e:
         err("targets fetch failed:", e)
-        return
+        return True  # сервер ответил ошибкой — он достижим, рестарт не нужен
     if not targets:
         err("сервер вернул пустой список таргетов")
-        return
+        return True
     xray_bin = _find_xray()
     if not xray_bin:
         err("xray-core не найден. Поставь бинарь в ~/.xrs-probe/xray "
@@ -549,11 +585,7 @@ def one_cycle():
         results = [{"name": t.get("name") or t.get("host") or "?", "ok": False,
                     "rtt": 0, "err": "xray-core not found on probe device"}
                    for t in targets]
-        try:
-            report(geo, results)
-        except Exception as e:
-            err("report failed:", e)
-        return
+        return _try_report(geo, results)
     if not _check_xray_health(xray_bin):
         # Бинарь есть, но не запускается. Гасим цикл с явной ошибкой —
         # дальнейшие probe всё равно упадут. Реальная причина в логе выше.
@@ -561,11 +593,7 @@ def one_cycle():
                     "rtt": 0,
                     "err": "xray бинарь не запускается на устройстве (см. agent.log)"}
                    for t in targets]
-        try:
-            report(geo, results)
-        except Exception as e:
-            err("report failed:", e)
-        return
+        return _try_report(geo, results)
     direct_ip = fetch_direct_ip()
     log("targets=%d, xray=%s, direct_ip=%s"
         % (len(targets), _xray_checked["ver"] or "?", direct_ip or "?"))
@@ -584,8 +612,32 @@ def one_cycle():
         resp = report(geo, results)
         log("cycle: %d тестов, %d ok, geo=%s, saved=%s"
             % (len(results), n_ok, geo, resp.get("saved")))
+        return True
+    except ServerUnreachable as e:
+        err("report failed:", e)
+        return False
     except Exception as e:
         err("report failed:", e)
+        return True
+
+
+def _self_restart():
+    """Перезапускает процесс агента начисто. Зачем: после выключения VPN на
+    устройстве у Python-процесса остаётся «отравленный» DNS-резолвер (домен
+    statuspage резолвится в fake-ip от ушедшего VPN) → Connection refused,
+    пока процесс не пересоздан. На POSIX os.execv заменяет образ процесса
+    свежим (мгновенно). На Windows os.execv плохо дружит со Scheduled Task —
+    выходим с кодом 1, и task поднимет нас заново (RestartCount=3)."""
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    if os.name == "posix":
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            err("execv не удался (%s) — выходим, supervisor перезапустит" % e)
+    sys.exit(1)
 
 
 def main():
@@ -598,12 +650,26 @@ def main():
         sys.exit(2)
     log("start: interval=%ds, target=%s, geo-expected=%s"
         % (INTERVAL, STATUSPAGE_URL, EXPECT_COUNTRY))
+    # Сколько циклов подряд «сервер недостижим» терпим до авто-рестарта.
+    restart_after = int(os.environ.get("PROBE_RESTART_AFTER_FAILS", "2"))
+    fails = 0
     while True:
         try:
-            one_cycle()
+            reached = one_cycle()
         except Exception as e:
             err("unexpected:", e)
-        time.sleep(INTERVAL)
+            reached = True  # неизвестная ошибка — не сетевая, рестарт не нужен
+        if reached:
+            fails = 0
+        else:
+            fails += 1
+            err("statuspage недостижим: %d/%d циклов подряд" % (fails, restart_after))
+            if fails >= restart_after:
+                err("перезапуск процесса для сброса DNS-резолвера…")
+                _self_restart()
+        # На сетевом сбое ретраим быстрее (не ждём полный INTERVAL), чтобы
+        # после выключения VPN агент восстановился за десятки секунд.
+        time.sleep(INTERVAL if reached else min(INTERVAL, 15))
 
 
 if __name__ == "__main__":

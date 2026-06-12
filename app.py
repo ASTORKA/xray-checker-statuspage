@@ -1144,7 +1144,10 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .bars{flex:1;display:block;height:26px;min-width:0;}
 .bars rect{transition:fill .3s, opacity .12s;cursor:pointer;}
 .bars rect:hover{opacity:.55;}
-.stat2{width:124px;flex:none;text-align:right;}
+/* margin-left:auto прижимает stat2 (и идущие за ним chev/delbtn) к правому
+   краю строки. В probe-only режиме 30-дневные бары переехали в bands, и без
+   этого спейсера статистика и кнопки «закрыть/удалить» паковались влево. */
+.stat2{width:124px;flex:none;text-align:right;margin-left:auto;}
 .stat2 .p{font-size:15px;font-weight:600;}
 .stat2 .s{font-size:12px;color:var(--tx3);}
 .chev{color:var(--tx3);margin-left:2px;flex:none;display:flex;align-items:center;justify-content:center;
@@ -1207,8 +1210,10 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .actoggle:disabled{opacity:.45;cursor:not-allowed;}
 .bands{display:flex;flex-direction:column;gap:4px;padding:4px 15px 12px;
   border-top:1px dashed var(--line);margin:2px 0 0;}
-.band{display:flex;align-items:center;gap:12px;cursor:pointer;padding:5px 8px;
-  border-radius:8px;transition:background .14s;}
+/* flex-wrap: чтобы строка ошибки (.bandErr, flex-basis:100%) переносилась
+   на отдельную строку под основным рядом и показывалась целиком. */
+.band{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;cursor:pointer;
+  padding:5px 8px;border-radius:8px;transition:background .14s;}
 .band:hover{background:var(--hover);}
 .bandName{display:flex;align-items:center;gap:7px;width:140px;flex:none;min-width:0;
   font-size:12.5px;color:var(--tx2);}
@@ -1227,6 +1232,10 @@ body{margin:0;background:var(--bg);color:var(--tx);
 .bandStat{width:110px;flex:none;text-align:right;}
 .bandPct{font-size:12.5px;font-weight:500;}
 .bandSub{font-size:11px;color:var(--tx3);}
+/* Полноширинная строка с полным текстом ошибки пробника (когда офлайн).
+   flex-basis:100% переносит её под основной ряд band'а; видно целиком. */
+.bandErr{flex-basis:100%;width:100%;font-size:11px;line-height:1.35;
+  color:var(--bad);padding:1px 2px 2px 24px;word-break:break-word;}
 .emptyBands{padding:10px 15px 14px;font-size:12.5px;color:var(--tx3);font-style:italic;
   border-top:1px dashed var(--line);}
 @media (max-width:560px){
@@ -1553,8 +1562,10 @@ function buildBand(item,r,s){
   var pct=document.createElement("div");pct.className="bandPct";
   var sub=document.createElement("div");sub.className="bandSub";
   st.appendChild(pct);st.appendChild(sub);
-  b.appendChild(nm);b.appendChild(bars);b.appendChild(st);
-  b._dot=dot;b._bars=bars;b._pct=pct;b._sub=sub;b._rects=[];
+  // Полноширинная строка ошибки (под основным рядом) — показывает err целиком.
+  var errLine=document.createElement("div");errLine.className="bandErr";errLine.style.display="none";
+  b.appendChild(nm);b.appendChild(bars);b.appendChild(st);b.appendChild(errLine);
+  b._dot=dot;b._bars=bars;b._pct=pct;b._sub=sub;b._err=errLine;b._rects=[];
   // Клик по полосе раскрывает панель именно для этого пробника (по имени —
   // на бэке мерджатся все probe_id с этим именем).
   b.addEventListener("click",function(e){
@@ -1627,19 +1638,26 @@ function updateBand(b,r){
     b._pct.textContent=r.uptime30.toFixed(2)+"%";
     b._pct.style.color=srvUpColor(r.uptime30);
   }
-  var line="";
+  var line="";var errFull="";
   if(!r.fresh){
     var ago=Math.floor((Date.now()/1000-(r.lastSeenTs||0))/60);
     line="нет данных "+(ago>0?ago+" мин":"только что");
   }else if(r.online&&r.latencyMs>0){
     line=r.latencyMs+" ms";
   }else if(!r.online&&r.err){
-    line=r.err.length>32?r.err.slice(0,32)+"…":r.err;
+    line="ошибка";          // короткий тег справа
+    errFull=r.err;          // полный текст — в отдельной строке ниже
     b.title=r.err;
   }else{
     line="—";
   }
   b._sub.textContent=line;
+  // Полноширинная строка ошибки: показываем целиком, скрываем если ошибки нет.
+  if(errFull){
+    b._err.textContent=errFull;b._err.style.display="";
+  }else{
+    b._err.textContent="";b._err.style.display="none";
+  }
 }
 function buildList(data){
   var list=document.getElementById("list");
@@ -1873,7 +1891,7 @@ _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked",
                 "bands", "band", "bandName", "bandPName", "bandDot",
                 "bandDotOk", "bandDotBad", "bandDotStale", "bandBars",
-                "bandStat", "bandPct", "bandSub", "emptyBands"]
+                "bandStat", "bandPct", "bandSub", "bandErr", "emptyBands"]
 _UNIQ_PREFIX = "c" + os.urandom(3).hex()
 
 
