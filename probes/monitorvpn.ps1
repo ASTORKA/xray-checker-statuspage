@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   CLI для управления probe-агентом xray-checker-statuspage на Windows.
 

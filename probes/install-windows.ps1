@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Установщик probe-агента xray-checker-statuspage для Windows.
 
