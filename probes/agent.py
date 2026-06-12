@@ -205,7 +205,13 @@ def _stream_settings(t):
 
 def _build_xray_config(t, http_port):
     """xray-конфиг: один HTTP-inbound на 127.0.0.1:http_port + один outbound
-    из таргета. Через этот inbound HTTP-клиент попадает в туннель."""
+    из таргета. Через этот inbound HTTP-клиент попадает в туннель.
+    Пустые опциональные поля выкидываем — xray-core строгий и часто отвергает
+    конфиг с явно пустыми строками вместо отсутствующего ключа."""
+    user = {"id": t["uuid"], "encryption": "none"}
+    flow = (t.get("flow") or "").strip()
+    if flow:
+        user["flow"] = flow
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [{
@@ -221,11 +227,7 @@ def _build_xray_config(t, http_port):
             "settings": {"vnext": [{
                 "address": t["host"],
                 "port": int(t["port"]),
-                "users": [{
-                    "id": t["uuid"],
-                    "encryption": "none",
-                    "flow": t.get("flow") or "",
-                }],
+                "users": [user],
             }]},
             "streamSettings": _stream_settings(t),
         }],
@@ -241,7 +243,18 @@ def xray_probe(xray_bin, t):
     port = _free_port()
     cfg = _build_xray_config(t, port)
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    # stderr xray-core → отдельный файл: PIPE+read блокирует, а нам нужно
+    # уметь читать stderr в любой момент (для диагностики).
+    err_log = tempfile.NamedTemporaryFile("w+b", suffix=".log", delete=False)
     proc = None
+
+    def _read_stderr():
+        try:
+            err_log.flush(); err_log.seek(0)
+            return err_log.read().decode("utf-8", "ignore").strip()
+        except Exception:
+            return ""
+
     try:
         json.dump(cfg, tmp); tmp.close()
         t0 = time.monotonic()
@@ -249,20 +262,26 @@ def xray_probe(xray_bin, t):
             proc = subprocess.Popen(
                 [xray_bin, "run", "-c", tmp.name],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE)
+                stderr=err_log)
         except (FileNotFoundError, PermissionError) as e:
-            return False, 0, "xray-core run failed: " + str(e)[:120]
+            return False, 0, "xray run failed: " + str(e)[:120]
         if not _wait_port(port, timeout=min(TIMEOUT, 3.0)):
-            # xray не поднялся → читаем stderr для диагностики.
-            stderr_tail = b""
+            # xray не поднялся (или упал). Читаем stderr — там реальная
+            # причина (битый конфиг, отсутствующий ключ REALITY, etc.).
             try:
-                proc.terminate()
-                stderr_tail = (proc.stderr.read(400) if proc.stderr else b"")
+                proc.terminate(); proc.wait(timeout=1.5)
             except Exception:
                 pass
-            err_msg = stderr_tail.decode("utf-8", "ignore").strip()[:160] \
-                      or "xray не открыл прокси-порт (проверь конфиг)"
-            return False, 0, err_msg
+            time.sleep(0.2)  # дать xray дописать сообщения об ошибке
+            stderr_text = _read_stderr()
+            # В лог агента — полный stderr, в err отчёта — последняя строка.
+            if stderr_text:
+                err("xray stderr (target=%s): %s"
+                    % (t.get("name") or t.get("host"), stderr_text[:800]))
+                last_line = stderr_text.strip().splitlines()[-1].strip()
+                return False, 0, last_line[:200] or "xray exited без сообщения"
+            return False, 0, ("xray не открыл прокси-порт за 3с "
+                              "(stderr пуст; проверь права/Gatekeeper)")
         try:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({
@@ -278,6 +297,11 @@ def xray_probe(xray_bin, t):
                 return True, rtt, ""
             return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
         except urllib.error.URLError as e:
+            # Если туннель не открылся — внутри xray может быть лог почему.
+            stderr_text = _read_stderr()
+            if stderr_text:
+                err("xray stderr во время probe (target=%s): %s"
+                    % (t.get("name") or t.get("host"), stderr_text[-400:]))
             return False, 0, "туннель: " + str(e.reason)[:140]
         except (socket.timeout, OSError) as e:
             return False, 0, type(e).__name__ + ": " + str(e)[:140]
@@ -290,9 +314,12 @@ def xray_probe(xray_bin, t):
                 try: proc.kill()
                 except Exception: pass
         try:
-            os.unlink(tmp.name)
+            err_log.close()
         except Exception:
             pass
+        for fp in (tmp.name, err_log.name):
+            try: os.unlink(fp)
+            except Exception: pass
 
 
 def report(geo, results, vpn=False):
