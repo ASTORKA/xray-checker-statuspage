@@ -187,7 +187,12 @@ switch ($canon) {
                 'Xray-windows-arm64-v8a.zip'
             } else { 'Xray-windows-64.zip' }
         } else { 'Xray-windows-32.zip' }
-        $url = "https://github.com/XTLS/Xray-core/releases/latest/download/$arch"
+        $xrayVer = if ($env:XRAY_VERSION) { $env:XRAY_VERSION } else { 'v25.10.27' }
+        $url = if ($xrayVer -eq 'latest') {
+            "https://github.com/XTLS/Xray-core/releases/latest/download/$arch"
+        } else {
+            "https://github.com/XTLS/Xray-core/releases/download/$xrayVer/$arch"
+        }
         $tmpZip = Join-Path $env:TEMP "xray-$([System.IO.Path]::GetRandomFileName()).zip"
         $tmpDir = Join-Path $env:TEMP "xray-$([System.IO.Path]::GetRandomFileName())"
         $xrayPath = Join-Path $AppDir 'xray.exe'

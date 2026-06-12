@@ -109,7 +109,15 @@ if [ ! -x "${APP_DIR}/xray" ]; then
     x86_64|amd64)  ZIP_NAME="Xray-macos-64.zip" ;;
     *) die "неизвестная архитектура macOS: ${ARCH}. Поставь xray вручную: брось бинарь в ${APP_DIR}/xray" ;;
   esac
-  XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/${ZIP_NAME}"
+  # Пинимся на v25.10.27 — последняя версия до 26.x, где REALITY-конфиг
+  # стал требовать поле password (которого в обычных подписках нет).
+  # Override: XRAY_VERSION=v1.8.24 (или latest) bash install-macos.sh.
+  XRAY_VERSION="${XRAY_VERSION:-v25.10.27}"
+  if [ "${XRAY_VERSION}" = "latest" ]; then
+    XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/${ZIP_NAME}"
+  else
+    XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${ZIP_NAME}"
+  fi
   TMP="$(mktemp -d)"
   if curl -fL --retry 2 "${XRAY_URL}" -o "${TMP}/xray.zip"; then
     if unzip -oq "${TMP}/xray.zip" xray -d "${APP_DIR}" 2>/dev/null; then
