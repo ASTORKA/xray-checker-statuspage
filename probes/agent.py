@@ -164,9 +164,16 @@ def report(geo, results):
 
 def one_cycle():
     geo = fetch_geo()
+    # VPN-страж: если geo определилось и НЕ совпадает с EXPECT_COUNTRY —
+    # на устройстве с большой вероятностью включён VPN, пробы пойдут через
+    # туннель и дадут искажённую картину. Не отправляем такой цикл вообще.
+    # Если geo не определилось (timeout/ошибка ifconfig.co) — отправляем как
+    # обычно, доверяем пользователю (иначе при первых сбоях сети пробник
+    # вообще ничего не пришлёт).
     if EXPECT_COUNTRY and geo and geo != EXPECT_COUNTRY:
-        log("warn: geo=%s, ожидалось %s — возможно включён VPN на этом устройстве"
+        log("VPN detected: geo=%s, ожидалось %s — цикл пропущен, отчёт не отправлен"
             % (geo, EXPECT_COUNTRY))
+        return
     try:
         targets = fetch_targets()
     except Exception as e:

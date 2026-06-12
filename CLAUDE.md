@@ -1,43 +1,55 @@
 # CLAUDE.md
 
-Навигатор по проекту для агента Claude (и для людей, кому нужна «карта» механики).
-README рассчитан на пользователя-установщика; этот файл описывает, **как всё устроено
-внутри** и почему сделано именно так.
+Карта проекта для агента Claude (и для людей, кому нужна полная картина
+механики). README рассчитан на пользователя-установщика; этот файл описывает
+**как всё устроено внутри и почему так**.
 
 ## Что это
 
 Кастомная страница статуса VPN/прокси-серверов поверх
-[xray-checker](https://github.com/kutovoys/xray-checker). xray-checker реально тестит
-прокси через Xray; этот проект **только опрашивает его API, копит историю в SQLite и
-рисует страницу**. Своего тестирования прокси здесь нет.
+[xray-checker](https://github.com/kutovoys/xray-checker). xray-checker реально
+тестит прокси через Xray и отдаёт API; этот проект — навигатор и хранилище
+истории поверх него.
+
+**Текущая модель (probe-only):** живой статус «работает / не работает» считается
+**только из данных region-пробников**, поставленных на устройства пользователя
+в зоне блокировки (РФ). xray-checker остался **только как поставщик списка
+серверов** (имена, флаги, группы). Это сделано потому что облачный чекер не
+видит блокировки по фингерпринту/SNI/IP, активные в РФ.
 
 ```
-xray-checker  →  тестит прокси через Xray            (порт 2112, внутренний)
-statuspage    →  опрашивает checker, копит SQLite,    (порт 8080)
-                 отдаёт HTML + JSON-API
+xray-checker        →  поставщик списка серверов (имена, флаги)
+probe-агент         →  ходит на устройстве в РФ, делает TLS handshake к каждому
+                       конфигу из подписки и репортит на сервер
+statuspage          →  собирает имена от чекера + результаты от пробников,
+                       рисует страницу, хранит историю в SQLite
 ```
 
 ## Стек и философия
 
-- **Один файл — `app.py`.** Чистый Python 3.12, только стандартная библиотека
-  (`http.server`, `sqlite3`, `urllib`, `gzip`, `threading`). Никаких зависимостей,
-  никакого фреймворка, нет `requirements.txt`. Это сознательно: образ
-  `python:3.12-slim` + один файл, мгновенная сборка, нечего ломаться.
+- **Один файл — `app.py`.** Чистый Python 3.12, только stdlib
+  (`http.server`, `sqlite3`, `urllib`, `gzip`, `threading`, `base64`, `ssl`).
+  Никаких зависимостей, никакого фреймворка, нет `requirements.txt`. Это
+  сознательно: `python:3.12-slim` + один файл, мгновенная сборка.
 - **Фронтенд встроен в `app.py`** как строка `INDEX_HTML` (HTML+CSS+vanilla JS).
   Сборки фронта нет. Темизация — на CSS-переменных.
 - **БД — SQLite** в одном файле (`/data/status.db`), режим WAL.
+- **Пробник тоже одно-файловый Python** (`probes/agent.py`), только stdlib.
 
 ## Файлы репозитория
 
 | Файл | Назначение |
 |---|---|
-| `app.py` | Весь backend + встроенный frontend. ~1000 строк. |
-| `Dockerfile` | `python:3.12-slim`, копирует `app.py`, запускает `python -u app.py`. |
-| `docker-compose.example.yml` | Пример: сервисы `xray-checker` + `statuspage`. |
-| `install.sh` | Интерактивный установщик (Docker, nginx, HTTPS, генерация токенов). |
-| `README.md` | Документация для пользователя. |
+| `app.py` | Весь backend + встроенный frontend. ~2000 строк. |
+| `Dockerfile` | `python:3.12-slim` + `app.py`, запускает `python -u app.py`. |
+| `docker-compose.example.yml` | Пример: `xray-checker` + `statuspage`. |
+| `install.sh` | Установщик сервера: Docker, nginx, HTTPS, ADMIN_TOKEN. |
+| `README.md` | Док для пользователя. |
 | `CLAUDE.md` | Этот файл. |
 | `.github/workflows/docker.yml` | Сборка образа в GHCR при пуше в `main`. |
+| `probes/agent.py` | Probe-агент (TLS handshake, отчёты). |
+| `probes/install-macos.sh` | Установщик агента на macOS (LaunchAgent). |
+| `probes/monitorvpn` | CLI для управления агентом на macOS. |
 
 `install.sh` ставит Docker/nginx/HTTPS, генерирует `ADMIN_TOKEN`, пишет
 `docker-compose.yml` (узел тянет готовый образ из GHCR — без локальной сборки).
@@ -46,284 +58,409 @@ statuspage    →  опрашивает checker, копит SQLite,    (порт
 
 ### 1. Конфиг (env-переменные)
 
-Читаются в начале `app.py` из `os.environ`. Полный список с дефолтами — таблица в
-README. Ключевые для механики:
+Читаются в начале `app.py`. Полный список с дефолтами — таблица в README.
 
-| Переменная | Дефолт | Влияет на |
+**Сервер:**
+
+| Переменная | Дефолт | Назначение |
 |---|---|---|
-| `CHECKER_URL` | `http://xray-checker:2112` | откуда брать прокси |
-| `POLL_INTERVAL` | `60` | период опроса чекера (сек) |
+| `CHECKER_URL` | `http://xray-checker:2112` | откуда брать имена серверов |
+| `POLL_INTERVAL` | `60` | период опроса чекера (для синка имён) |
 | `DAYS` | `30` | ширина шкалы аптайма |
-| `SAMPLE_RETAIN_DAYS` | `DAYS+1` | сколько дней хранить поминутные сэмплы |
+| `SAMPLE_RETAIN_DAYS` | `DAYS+1` | retain старых (xray-checker) сэмплов |
 | `DB_PATH` | `/data/status.db` | путь к SQLite |
-| `ADMIN_TOKEN` | — (пусто) | включает админ-режим; пусто → выключен |
-| `STALE_AFTER_HOURS` | `24` | порог авто-удаления «призраков» |
-| `GLOBAL_OUTAGE_RATIO` | `1.0` | порог отсева глобальных сбоев чекера |
 | `SERVER_HEADER` | `nginx` | маскировка заголовка `Server` |
+| `ADMIN_TOKEN` | — | секрет админ-режима; пусто → выключен |
+| `STALE_AFTER_HOURS` | `24` | порог авто-удаления «призраков» |
+| `GLOBAL_OUTAGE_RATIO` | `1.0` | отсев глобальных сбоев чекера |
+
+**Пробники:**
+
+| Переменная | Дефолт | Назначение |
+|---|---|---|
+| `PROBE_FRESH_MINUTES` | `10` | окно «свежести» проб для UI |
+| `PROBE_SAMPLE_RETAIN_HOURS` | `(DAYS+1)*24` | retain probe-сэмплов |
+| `PROBE_SUBSCRIPTION_URL` | — | URL подписки для пробников (сервер сам тянет/парсит и отдаёт агентам). Пусто → агенты получают 503. |
+| `PROBE_SUBSCRIPTION_USER_AGENT` | `v2rayN/6.40` | UA при запросе подписки (некоторые панели смотрят на UA). |
+| `PROBE_TARGETS_TTL_MIN` | `10` | TTL in-memory кеша таргетов. |
 
 ### 2. База данных
 
-`init_db()` создаёт таблицы (все — `CREATE TABLE IF NOT EXISTS`):
+`init_db()` создаёт все таблицы (`CREATE TABLE IF NOT EXISTS`):
 
-- **`current`** — последнее известное состояние каждого `sid`:
-  `(sid PK, name, online, latency, ts, seq)`. `seq` — порядок прокси в ответе чекера
-  (для стабильной сортировки строк). По одной записи на `stableId`.
-- **`daily`** — суточные агрегаты: `(day, sid, up, down, lat_sum, lat_cnt, down_conf)`,
-  PK `(day, sid)`. `up`/`down` — счётчики успешных/неудачных проверок за день.
-  `down_conf` — «подтверждённые» простои (см. ниже). `lat_sum`/`lat_cnt` — для среднего
-  пинга.
-- **`samples`** — поминутные точки: `(ts, sid, online, latency)`, индекс по `(sid, ts)`.
-  Хранятся `SAMPLE_RETAIN_DAYS` дней. Из них строится график пинга в раскрытой панели дня.
-- **`settings`** — key/value для рантайм-переключателей админ-режима
+**Серверы (xray-checker — только как источник имён):**
+- **`current`** — `(sid PK, name, online, latency, ts, seq)` — последнее
+  известное состояние каждого `sid`. В новой модели `online`/`latency` из
+  xray-checker НЕ показываются в UI, но поле `ts` используется авточисткой
+  призраков и `seq` — для стабильного порядка серверов.
+- **`daily`** — `(day, sid, up, down, lat_sum, lat_cnt, down_conf)` —
+  агрегаты xray-checker'а. **В UI не показываются** — но в БД пишутся
+  (на случай отката или переключения режима в будущем).
+- **`samples`** — `(ts, sid, online, latency)` — поминутные точки xray-checker.
+  Тоже хранятся, но в UI не используются.
+
+**Пробники:**
+- **`probes`** — `(probe_id PK, name, token_hash, created_at, last_seen,
+  last_geo)`. **Несколько `probe_id` могут иметь одинаковый `name`** — это
+  считается одним устройством (см. ниже про мердж).
+- **`probe_samples`** — `(ts, probe_id, sid, ok, rtt, err)` — поминутные
+  результаты TLS-handshake'ов. Чистится по `PROBE_SAMPLE_RETAIN_HOURS`
+  (default = `(DAYS+1)*24`, чтобы хватало на 30-дневный график).
+- **`probe_daily`** — `(day, probe_id, sid, up, down, lat_sum, lat_cnt,
+  down_conf)`, PK `(day, probe_id, sid)`. Агрегаты по дням для 30-дневной
+  шкалы аптайма.
+
+**Служебное:**
+- **`settings`** — k/v для рантайм-переключателей админ-режима
   (`autoclean`, `skip_global`). Переживает рестарт.
-- `hidden` — **устаревшая**, дропается при старте (`DROP TABLE IF EXISTS hidden`).
-  Осталась от ранней реализации «скрытых серверов».
+- `hidden` — устаревшая, дропается при старте (`DROP TABLE IF EXISTS`).
 
-Хелперы `get_setting`/`set_setting`/`_get_setting_c` — тонкая обёртка над `settings`.
-`autoclean_default()` / `skip_global_default()` дают дефолт, согласованный с env-порогами.
+### 3. Поток данных
 
-### 3. Опрос чекера — `poll_once()` / `poller()`
+```
+┌─────────────────┐ poll_once          ┌──────────────────┐
+│ xray-checker    │ ──── каждые ────▶  │  current/daily/   │
+│ /api/v1/proxies │   POLL_INTERVAL    │  samples          │
+└─────────────────┘                    └────────┬──────────┘
+                                                │ (используется
+                                                │  только current
+                                                │  для имён/групп)
+                                                ▼
+┌─────────────────┐                    ┌──────────────────┐
+│ probe-агент     │ ──── каждые ────▶  │  probe_samples /  │
+│ (Mac/Linux/...) │   INTERVAL         │  probe_daily      │
+└─────────────────┘   POST /report     └────────┬──────────┘
+                                                │
+                                                ▼
+                                        ┌──────────────────┐
+                                        │  build_summary    │
+                                        │  → /api/summary   │
+                                        └──────────────────┘
+```
 
-`poller()` — фоновый поток (daemon), вызывает `poll_once()` каждые `POLL_INTERVAL` секунд.
-`poll_once()`:
+### 4. `poll_once()` / `poller()`
 
-1. `fetch_proxies()` — GET `CHECKER_URL/api/v1/public/proxies`, парсит JSON, достаёт
-   массив `data`. Если чекер недоступен — исключение, цикл пропускается (ничего не
-   пишется, прошлые данные целы).
-2. **Отсев глобального сбоя** (см. раздел «Глобальные сбои» ниже): если доля офлайн-прокси
-   в этом ответе ≥ `GLOBAL_OUTAGE_RATIO` и тогл `skip_global` включён — `return`, цикл не
-   пишется.
+`poller()` — фоновый поток (daemon), вызывает `poll_once()` каждые
+`POLL_INTERVAL` секунд. `poll_once()`:
+
+1. `fetch_proxies()` — GET `CHECKER_URL/api/v1/public/proxies`. Недоступен →
+   исключение, цикл пропускается.
+2. **Отсев глобального сбоя**: если доля офлайн-прокси ≥ `GLOBAL_OUTAGE_RATIO`
+   и тогл `skip_global` в settings включён → `return`. Это спасает от
+   ложных одинаковых аптаймов у всех серверов когда чекер падает.
 3. Для каждого прокси с непустым `stableId`:
-   - вычисляет `down_conf`: 1, если сервер офлайн **и** в прошлый раз тоже был офлайн
-     **и** прошлый опрос был недавно (`≤ POLL_INTERVAL*2`). Это «подтверждённый» простой:
-     одиночный блип (1 неудача) не считается за простой, 2 подряд → 1 интервал и т.д.
+   - вычисляет `down_conf` («подтверждённый» простой — 2 подряд офлайн
+     от того же sid),
    - `UPSERT` в `current`, инкремент в `daily`, `INSERT` в `samples`.
-4. **Авточистка «призраков»** (если включена) — удаляет группы `sid`, которые чекер
-   перестал отдавать (см. ниже).
-5. Чистка старья: `daily` старше `DAYS+1`, `samples` старше `SAMPLE_RETAIN_DAYS`.
+4. **Авточистка призраков**: удаляет sid'ы которые чекер перестал отдавать
+   (см. ниже).
+5. Чистка старья: `daily` старше `DAYS+1`, `samples` старше
+   `SAMPLE_RETAIN_DAYS`.
 
-### 4. Группировка по имени хоста
+### 5. Группировка `current` по имени хоста
 
-**Зачем.** Один логический хост в подписке может быть представлен несколькими
-`stableId` — например, когда внутри хоста работает роутинг между апстримами, или когда
-после смены конфига чекер сгенерировал новый `stableId`. У таких записей **совпадает
-`name`**. Если показывать их раздельно — куча дублей с дырявыми барами.
+Один логический хост в подписке может быть несколькими `stableId` (роутинг
+внутри хоста, или смена парсера/конфига → новый id). `build_summary` группирует
+`current` по сырому `name`. Текущий статус группы — по самому свежему члену,
+агрегаты — наложением (сумма проверок всех членов).
 
-**Как.** `build_summary()` группирует `current` по сырому `name` (до `display_name`) и
-отдаёт **одну строку на имя**:
+### 6. Авточистка «призраков» (stale cleanup)
 
-- Текущий статус (точка/пинг) — по самому свежему члену группы (`ts` max): это тот
-  sub-сервер, что сейчас активен в роутинге.
-- 30-дневный аптайм — «наложение графиков»: за каждый день суммируем проверки всех
-  членов группы и берём долю успешных: `pct = sum_up / (sum_up + sum_down)`. Это
-  корректно и для чередующихся `sid` (старый умер, новый родился — на каждый день
-  активен один, его данные и берутся), и для одновременно опрашиваемых.
-  > ⚠️ Тут была бага: формула `min(sum_up, cycles)/cycles` маскировала сбои (ложные
-  > 100%) и удваивала аптайм (42% → 84.88% у всех). Сейчас — простая сумма, без `min`.
-- `downMin` за день: `sum(down_conf) / n_активных_членов * минут_в_интервале` —
-  деление чтобы при одновременном опросе не удваивать минуты простоя.
-- В JSON-поле `members` — число `sid` за группой (1 = одиночный хост).
+Когда у сервера меняется `stableId`, старая запись висит в `current` офлайн
+навсегда. В конце `poll_once`:
 
-`_day_payload()` (для раскрытой панели дня) тоже работает по группе: тянет `samples`
-всех членов, **роллапит по `ts`** — «любой online → группа online», латентность =
-минимум среди online-членов. Получается чистый таймлайн пинга вместо мешанины.
+- группируем `current` по `name`, удаляем из `current/daily/samples` только
+  те группы, у которых **ВСЕ** члены старше `STALE_AFTER_HOURS`. Хост с
+  альтернирующим роутингом не задевается.
+- Управление: env `STALE_AFTER_HOURS` (0 = мастер-выключатель) + тогл
+  `autoclean` в settings (UI админ-режима).
 
-### 5. Авто-удаление «призраков» (stale cleanup)
+### 7. Отсев глобальных сбоев чекера
 
-Когда у сервера меняется `stableId` (апдейт парсера чекера, мелкая правка подписки),
-старая запись висит в `current` офлайн навсегда. Авточистка в конце `poll_once()`:
+Если в одном опросе доля офлайн-прокси ≥ `GLOBAL_OUTAGE_RATIO` (default 1.0 =
+когда офлайн все) и тогл `skip_global` включён — цикл не пишется в
+`daily/samples`. Это значит ВСЕ серверы упали одновременно — практически
+такого не бывает, это всегда артефакт чекера (рестарт, сетевой сбой). Раньше
+без этого у географически разных серверов копился одинаковый ложный
+даунтайм.
 
-- группирует `current` по `name`, удаляет из `current`/`daily`/`samples` только те
-  группы, у которых **ВСЕ** члены старше `STALE_AFTER_HOURS`. Хост с альтернирующим
-  роутингом не задевается: пока хоть один член свежий — группа жива.
-- Управление: env `STALE_AFTER_HOURS` (0 = выкл, мастер-выключатель) + тогл `autoclean`
-  в settings (UI админ-режима).
+### 8. Пробники: основной источник данных в UI
 
-### 6. Отсев глобальных сбоев чекера
+**`probes` таблица** хранит регистрации. Каждый `probe_id` отдельный, но
+**мердж по имени** — несколько `probe_id` с одинаковым `name` считаются одним
+физическим устройством. Это нужно потому что повторная установка
+`install-macos.sh` создавала новый `probe_id`, а старые висели → дубль.
+Решение в две стороны:
+- `install-macos.sh` шлёт `replace=true` при регистрации → старые с тем же
+  именем удаляются (вместе с их samples/daily).
+- В `build_summary` `regional[]` всегда группируется по имени — даже если
+  дубли остались, на странице они сольются.
 
-**Симптом, который это лечит:** географически разные серверы (Швеция, Эстония, …)
-показывают идентичный аптайм и одинаковое число «ошибок опроса» при разном пинге.
+**`save_probe_report(probe_id, geo, results)`**:
+1. Резолвит `name` каждого результата в canonical `sid` (мин seq группы).
+2. Мерджит результаты с одинаковым sid: «любой ok → группа ok», rtt =
+   min(ok-only).
+3. Считает `down_conf` — 1 если этот результат офлайн И прошлый sample
+   того же probe×sid тоже офлайн (≤ 2× окна свежести назад).
+4. INSERT в `probe_samples`, UPSERT в `probe_daily`.
+5. Обновляет `last_seen`/`last_geo` пробника.
+6. Чистит `probe_samples`/`probe_daily` старше retain.
 
-**Причина:** xray-checker в моменты рестарта / сетевого сбоя / перечитывания подписки
-отдаёт `online:false` сразу по ВСЕМ прокси. Раньше это писалось как простой каждому
-серверу → у всех копился одинаковый ложный даунтайм. Серверы в разных странах не могут
-отказать в одну секунду — это всегда сам чекер.
+**В `build_summary`**: для каждой группы серверов и каждого уникального
+имени пробника считает агрегаты по `probe_daily` (по всем `probe_id` с этим
+именем, по всем `sid` группы). Поле каждой строки:
 
-**Решение:** если в одном опросе доля офлайн-прокси ≥ `GLOBAL_OUTAGE_RATIO` (дефолт
-`1.0` = когда офлайн все) и тогл `skip_global` включён — цикл считается артефактом
-чекера и **не пишется в историю** (ни `daily`, ни `samples`; `current` тоже не
-трогаем — живёт последнее известное состояние). Работает только при ≥ 2 прокси.
+```jsonc
+{
+  "sid": "...", "name": "Россия", "cc": "ru",
+  "online": true,       // зелёная точка если кто-то fresh ok
+  "noData": false,      // если regional пуст
+  "anyFresh": true,
+  "latencyMs": 47,
+  "uptime30": 99.5,
+  "regional": [
+    {
+      "probe": "Mac-home",       // имя — идентификатор полосы
+      "probeIds": ["p-...", "p-..."],  // все probe_id с этим именем
+      "probe_id": "p-...",       // canonical (для legacy)
+      "fresh": true,             // данные за последние PROBE_FRESH_MINUTES
+      "online": true, "latencyMs": 47, "err": "",
+      "uptime30": 99.5, "downMin30": 12,
+      "days": [{ "date": "...", "uptime": 100.0, "downMin": 0, "hasData": true }, ...]
+    }
+  ]
+}
+```
 
-Forward-only: уже накопленный ложный простой задним числом не стирается (пересчёт
-`daily` из `samples` небезопасен — при `SAMPLE_RETAIN_DAYS < DAYS` затёрло бы историю
-старше окна сэмплов). Старое уходит из 30-дневного окна за `DAYS` дней; для чистого
-старта — удалить `data/status.db`.
+### 9. HTTP-эндпоинты
 
-### 7. HTTP-сервер и эндпоинты
-
-`Handler(BaseHTTPRequestHandler)` + `ThreadingHTTPServer`. `_send()` умеет gzip
-(для text/json/svg при `Accept-Encoding`), ставит `Cache-Control`, `X-Robots-Tag`,
+`Handler(BaseHTTPRequestHandler)` + `ThreadingHTTPServer`. `_send()` умеет
+gzip (для text/json/svg), gzip, ставит `Cache-Control`, `X-Robots-Tag`,
 маскирует `Server`.
 
-**GET:**
+**Публичные GET:**
 
-| Путь | Отдаёт |
+| Путь | Ответ |
 |---|---|
-| `/`, `/index.html` | HTML страницы (`page_html()`) |
-| `/api/summary` | `build_summary()` — список серверов + тоталы + `adminEnabled` |
-| `/api/today?sid=` | `build_today(sid)` — детализация сегодня |
-| `/api/day?sid=&date=` | `build_day(sid, date)` — детализация конкретного дня |
-| `/api/admin/settings` | (admin) текущие тоглы: `autoclean`, `skipGlobal`, локи |
-| `/favicon.ico`,`/favicon.png`,`/logo` | брендовая картинка из `data/` |
-| `/fonts/*.woff2` | локальные шрифты Inter |
+| `/`, `/index.html` | HTML страницы |
+| `/api/summary` | `build_summary()` — серверы + regional[] + totals |
+| `/api/today?sid=&probeName=` | детализация сегодня для пробника (имя!) |
+| `/api/day?sid=&date=&probeName=` | детализация конкретного дня |
+| `/favicon.ico`, `/logo`, `/fonts/*` | бренд/шрифты |
 | `/health` | `OK` |
 
-**POST (все под `X-Admin-Token`):**
+**Админ GET (под `X-Admin-Token`):**
 
 | Путь | Действие |
 |---|---|
-| `/api/admin/check` | валидация токена (200/401; 404 если `ADMIN_TOKEN` пуст) |
-| `/api/admin/delete` `{sid}` | удалить всю группу хоста по `sid` |
-| `/api/admin/settings` `{autoclean?, skipGlobal?}` | переключить тоглы |
+| `/api/admin/probes` | список пробников + `freshMinutes` |
+| `/api/admin/probe-diag` | диагностика подписки (10+ User-Agent'ов) |
 
-Аутентификация — `_is_admin()`: сравнение `X-Admin-Token` с `ADMIN_TOKEN` через
-`_consteq` (защита от timing-атак). Без `ADMIN_TOKEN` в env весь админ-функционал
-выключен: эндпоинты 401/404, иконка-замок не рисуется.
+**Админ POST (под `X-Admin-Token`):**
 
-### 8. Фронтенд (строка `INDEX_HTML`)
+| Путь | Body | Действие |
+|---|---|---|
+| `/api/admin/check` | — | валидация токена |
+| `/api/admin/delete` | `{sid}` | удалить группу хоста по `sid` |
+| `/api/admin/settings` | `{autoclean?, skipGlobal?}` | тоглы |
+| `/api/admin/probes` | `{name, replace?}` | создать пробник; replace=true сносит существующих с этим именем |
 
-Один HTML-шаблон с инлайн CSS и vanilla JS. Плейсхолдеры `__TITLE__`, `__LOGO__` и т.п.
-подставляются в `page_html()`.
+**Probe POST (под `X-Probe-Token`):**
 
-- **Загрузка данных:** `load()` дёргает `/api/summary` каждые 60 сек, рисует строки
-  (`buildList`/`applyServer`). Клик по строке раскрывает панель → `/api/today`; клик по
-  бару дня → `/api/day`.
-- **Темы:** 4 штуки — `light`, `dark`, `claude` (тёплая кремовая, акцент `#D97757`),
-  `claude-dark` (тёплая тёмная). Кнопка в шапке циклирует, выбор в `localStorage`.
-  Палитры — на CSS-переменных (`--bg`, `--card`, `--ok`, …), переключаются через
-  `html[data-theme=...]`.
-- **Админ-режим:** иконка-замок → prompt токена → `localStorage` → появляется кнопка
-  `×` у каждой строки (удаление группы) и панель `#adminbar` с двумя тоглами:
-  «Авто-удаление устаревших записей» (`autoclean`) и «Игнорировать глобальные сбои
-  чекера» (`skip_global`). Логика тоглов — `loadAdminSettings()` + `postSetting()`.
+| Путь | Body | Действие |
+|---|---|---|
+| `/api/probe/report` | `{geo, results: [{name, ok, rtt, err}]}` | приём отчёта |
+| `/api/probe/targets` | — | список таргетов (host/port/sni/name) для теста |
 
-### 9. Анти-фингерпринт
+**DELETE (под `X-Admin-Token`):**
+- `/api/admin/probes/<probe_id>` — удалить пробник.
+
+Аутентификация:
+- `ADMIN_TOKEN` — константно-временное сравнение через `_consteq`.
+- `PROBE_TOKEN` — SHA-256-хеш в БД, lookup по индексу.
+
+### 10. Фронтенд (строка `INDEX_HTML`)
+
+Один HTML-шаблон с инлайн CSS и vanilla JS. Плейсхолдеры `__TITLE__`,
+`__LOGO__` подставляются в `page_html()`.
+
+**Главные DOM-узлы карточки сервера:**
+
+```html
+<div class="item">
+  <div class="row">
+    <div class="label">🏳️ Имя сервера ●</div>
+    <div class="stat2">99.5% / 47ms · 30дн</div>
+    <div class="chev">▾</div>
+    <!-- if admin: × -->
+  </div>
+  <div class="bands">                            <!-- список полос -->
+    <div class="band" _pid="Mac-home">          <!-- _pid = имя -->
+      <div class="bandName">●  Mac-home</div>
+      <svg class="bandBars">…30 rect…</svg>
+      <div class="bandStat">99.5% / 47ms</div>
+    </div>
+    <!-- ещё полосы -->
+  </div>
+  <div class="panel">…график пинга при раскрытии…</div>
+</div>
+```
+
+- `applyServer(item, s)` — обновляет общую шапку.
+- `applyBands(item, s)` — синхронизирует `.bands` контейнер с `s.regional[]`.
+  Идентификатор полосы — имя пробника (`r.probe`).
+- `buildBand`/`updateBand` — рендер одной полосы. Клик по полосе или по
+  бару дня раскрывает `.panel` с детализацией.
+- `_probeQ(name)` строит `&probeName=...`. `openPanel/refreshPanel/loadDay`
+  принимают имя, а не probe_id.
+
+**Темы**: 4 штуки — `light`, `dark`, `claude` (warm cream + copper-orange),
+`claude-dark` (warm dark + copper). Кнопка в шапке циклирует, выбор в
+`localStorage`. Палитры — на CSS-переменных, переключаются через
+`html[data-theme=...]`.
+
+**Админ-режим**: иконка-замок → `prompt()` токена → `localStorage` →
+появляется `×` у каждой строки (удаление группы) и панель `#adminbar` с
+двумя тоглами (`autoclean`, `skip_global`).
+
+### 11. Анти-фингерпринт
 
 Чтобы инстансы было сложнее находить по шаблонным CSS-классам:
 
-- `_uniquify()` при старте процесса заменяет «опознавательные» токены классов/id
-  (список `_UNIQ_TOKENS`: `tchart`, `adminbar`, `actoggle`, `delbtn`, `lock`, …) на
-  `c<random>token`. Префикс генерится из `os.urandom` один раз на запуск.
+- `_uniquify()` при старте процесса заменяет «опознавательные» токены
+  классов/id (список `_UNIQ_TOKENS`) на `c<random>token`. Префикс генерится
+  из `os.urandom` один раз на запуск. Префикс уникален каждый рестарт
+  контейнера.
 - Заголовок `Server` маскируется под `SERVER_HEADER` (дефолт `nginx`).
 - На странице `noindex, nofollow`.
 
-> **Важно при добавлении нового класса/id, который не должен «палиться»:** добавь его
-> базовое имя в `_UNIQ_TOKENS`, иначе в рандомизированном HTML класс останется
-> статичным (и JS, ищущий его по статичному имени, разойдётся с CSS). `id`-атрибуты,
-> которые ищет JS через `getElementById` (`ac-toggle`, `sg-toggle`, `adminbar`, …),
-> либо НЕ кладём в `_UNIQ_TOKENS` (если имя не «палевное»), либо переименование должно
-> быть согласовано и в CSS, и в JS — а так как `_uniquify` правит всю строку шаблона
-> разом, согласованность сохраняется автоматически.
+**При добавлении нового класса/id, который не должен «палиться»**: добавь
+его базовое имя в `_UNIQ_TOKENS`. Текущие токены: `tchart*`, `tscroll`,
+`overall`, `pgrad`, `delbtn`, `lockon`, `lock`, `adminbar`, `adminrow`,
+`adminlabel`, `actoggle`, `actogon`, `aclocked`, `bands`, `band`,
+`bandName`, `bandPName`, `bandDot`, `bandDot{Ok,Bad,Stale}`, `bandBars`,
+`bandStat`, `bandPct`, `bandSub`, `emptyBands`.
 
-### 10. Шрифты и брендинг
+## Probe-агент (`probes/agent.py`)
 
-- `ensure_fonts()` (фоновый поток при старте) скачивает Inter (woff2, latin+cyrillic) с
-  jsDelivr в `FONT_DIR` рядом с БД, если их там ещё нет. Отдаются с `/fonts/`.
-- `find_brand_image()` ищет файл `favicon*` (png/svg/ico/jpg/webp) в `data/` → отдаётся
-  как favicon и лого в шапке. Нет файла → дефолтный SVG-щит.
+Однофайловый Python (только stdlib). ENV:
 
-### 11. Региональные пробники
-
-**Проблема:** облачный xray-checker сидит вне зоны блокировок и пишет «всё ОК» даже когда
-конфиг забанен в РФ по фингерпринту/SNI/IP. Чтобы это видеть, на устройствах в РФ
-ставится **probe-агент** (`probes/agent.py`), который локально делает TLS handshake к
-каждому прокси-конфигу из подписки и репортит результат на наш сервер.
-
-**Таблицы:**
-- `probes(probe_id PK, name, token_hash, created_at, last_seen, last_geo)` —
-  зарегистрированные пробники; `token_hash` — SHA-256 от probe_token (сам токен не
-  хранится).
-- `probe_samples(ts, probe_id, sid, ok, rtt, err)` — результаты проверок. Чистится по
-  `PROBE_SAMPLE_RETAIN_HOURS` (default 72ч).
-
-**Эндпоинты:**
-
-| Метод+путь | Auth | Действие |
+| Переменная | Дефолт | |
 |---|---|---|
-| `POST /api/admin/probes` `{name}` | `X-Admin-Token` | создать пробник, вернуть `probe_id` + `probe_token` (один раз) |
-| `GET /api/admin/probes` | `X-Admin-Token` | список с `last_seen`/`last_geo` |
-| `DELETE /api/admin/probes/<id>` | `X-Admin-Token` | удалить + каскад на `probe_samples` |
-| `GET /api/probe/targets` | `X-Probe-Token` | список таргетов (host/port/sni/name) из `PROBE_SUBSCRIPTION_URL`, кеш на `PROBE_TARGETS_TTL_MIN` |
-| `POST /api/probe/report` | `X-Probe-Token` | приём отчёта `{geo, results: [...]}` |
+| `STATUSPAGE_URL` | — | куда репортить |
+| `PROBE_TOKEN` | — | выданный сервером при регистрации |
+| `INTERVAL` | `60` | период цикла, сек |
+| `TIMEOUT` | `10` | таймаут TLS handshake |
+| `EXPECT_COUNTRY` | `RU` | ожидаемый ISO-код страны |
+| `GEO_CHECK_URL` | `https://ifconfig.co/country-iso` | сервис для определения страны |
 
-**Подписка живёт на сервере.** Подписка часто доступна только через VPN — агент в зоне
-блокировки до неё не достучится. Сервер в облаке тянет её через `_fetch_subscription_text`
-(auto-decode base64), парсит `_parse_vless_line`, кеширует в `_targets_cache` под
-`_targets_lock`. На ошибке тянемки возвращает прошлый кеш. Бонус: секретный URL
-подписки не светится на устройствах пользователя.
+Цикл (`one_cycle()`):
 
-`save_probe_report`:
-- мапит входящие `name` → `canonical sid` группы (минимальный `seq` среди членов),
-- если для одного `sid` пришло несколько результатов (несколько sub-серверов с одним
-  `name`) — мерджит «любой ok → группа ok», `rtt = min(ok-only)`,
-- обновляет `last_seen`/`last_geo` пробника.
+1. `fetch_geo()` — определяет страну через `ifconfig.co/country-iso`.
+   На macOS у Python без `certifi` HTTPS-verify падает → есть fallback на
+   unverified context (geo-check не критичен для безопасности).
+2. **VPN-страж**: если geo определилось и `!= EXPECT_COUNTRY` → **цикл
+   пропускается, отчёт НЕ отправляется**. Это сделано чтобы не загрязнять
+   данные когда на устройстве пробника случайно включён VPN. Если geo не
+   определилось (timeout/ошибка ifconfig.co) — отчёт уходит, иначе при
+   первом же сбое сети пробник перестал бы работать.
+3. `fetch_targets()` — GET `STATUSPAGE_URL/api/probe/targets` с
+   `X-Probe-Token`. Сервер сам тянет подписку (PROBE_SUBSCRIPTION_URL) и
+   отдаёт разобранный список `[{name, host, port, sni}]`. Подписка с
+   устройства пользователя НЕ светится.
+4. Для каждого таргета — TCP-connect + TLS handshake к `host:port` с
+   правильным SNI. Сертификат не верифицируется (REALITY использует
+   невалидный — это норма). Если DPI обрывает на ClientHello — увидим
+   `ConnectionResetError`. IP-блок — `TimeoutError`/`refused`.
+5. `report()` — POST `STATUSPAGE_URL/api/probe/report`
+   `{geo, results: [...]}`.
 
-**В `build_summary`:** одним запросом тянем все `probe_samples` за окно
-`PROBE_FRESH_MINUTES` (default 10), в Python оставляем последнюю запись по каждой паре
-`(sid, probe_id)`, потом группируем по группе серверов. К каждой строке добавляется поле
-`probes: [{probe_id, name, ok, rtt, err, ts}]`. Старее окна — игнор.
+## CLI-команды
 
-**Frontend:** `applyProbes(item, probes)` снизу строки добавляет `.prblist` с цветными
-точками (`prbOk`/`prbBad`) + именем + RTT, ошибка в `title=` тултипе.
+### На сервере (Linux)
 
-**Агент (`probes/agent.py`):** автономный однофайловый Python-скрипт, только stdlib.
-- ENV: `STATUSPAGE_URL`, `PROBE_TOKEN`, `INTERVAL=60`, `TIMEOUT=10`, `EXPECT_COUNTRY=RU`,
-  `GEO_CHECK_URL`. **URL подписки на агенте не задаётся** — таргеты приходят с сервера.
-- Цикл: geo-check (`ifconfig.co/country-iso` с fallback на unverified SSL) → GET
-  `/api/probe/targets` (X-Probe-Token) → для каждого таргета TLS handshake к `host:port`
-  с правильным SNI (verify=NONE — REALITY это норма) → POST на сервер.
-- vmess/trojan пока не парсятся на сервере (MVP).
+```bash
+sudo bash install.sh        # установка/обновление statuspage + nginx + HTTPS
+                            # на "n" о перенастройке — pull нового образа +
+                            # перезапуск + при необходимости добавить ADMIN_TOKEN
+docker compose pull && docker compose up -d    # альтернатива
+docker compose logs -f statuspage              # логи
+docker exec statuspage env | grep PROBE        # проверить env
+```
 
-**Установка на macOS (`probes/install-macos.sh`):** интерактивно/через env собирает
-URL'ы и `ADMIN_TOKEN`, регистрирует пробника на сервере, кладёт `agent.py` в
-`~/.xrs-probe/`, регистрирует LaunchAgent `~/Library/LaunchAgents/com.xrs.probe.plist`
-(env-переменные внутри plist), `launchctl bootstrap`. Логи в `~/Library/Logs/xrs-probe.log`.
-`--uninstall` — обратное.
+### На macOS (пробник)
 
-**Безопасность:**
-- `probe_token` хранится только в `token_hash` (SHA-256); показывается пользователю один
-  раз при создании. На проверке (`find_probe_by_token`) хешируем входящий токен и ищем
-  в `probes` по `token_hash` — timing-atака нерелевантна, т.к. секрет = хеш + поиск по
-  индексу + утечка крайне узкая по сравнению с временем хеширования.
-- На пробнике токен лежит в plist в plain text (это машина пользователя, plist
-  доступен только владельцу).
+```bash
+# Установка
+mkdir -p ~/xrs-probe && cd ~/xrs-probe
+curl -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-macos.sh -o install-macos.sh
+bash install-macos.sh
+# спросит: URL статус-страницы, ADMIN_TOKEN, имя пробника
 
-## Жизненный цикл (main)
+# Управление (через CLI monitorvpn)
+monitorvpn start       # запустить агента
+monitorvpn stop        # остановить
+monitorvpn restart     # перезапуск
+monitorvpn status      # статус + последние строки лога
+monitorvpn logs        # tail -f лога
+monitorvpn delete      # полностью удалить
+```
 
-`main()`: `init_db()` → запускает `ensure_fonts()` и `poller()` в потоках → поднимает
-`ThreadingHTTPServer` на `0.0.0.0:PORT`.
+`monitorvpn` — bash-скрипт в `~/.xrs-probe/monitorvpn`, при установке через
+`install-macos.sh` создаётся symlink в `/usr/local/bin/monitorvpn`. Если нет
+прав на `/usr/local/bin/` — установщик подскажет точную `sudo ln -s` команду.
+
+### В админ-режиме на странице
+
+- Иконка-замок справа в шапке → `prompt()` ADMIN_TOKEN.
+- × напротив каждой строки сервера — удалить группу хоста.
+- В `#adminbar` под статистикой — два тогла:
+  - «Авто-удаление устаревших записей» (`autoclean`)
+  - «Игнорировать глобальные сбои чекера» (`skip_global`)
+- Кнопка темы — циклирует `light → dark → claude → claude-dark → light`.
+
+## Жизненный цикл
+
+`main()`: `init_db()` → фоновые потоки `ensure_fonts()` и `poller()` →
+поднимает `ThreadingHTTPServer` на `0.0.0.0:PORT`.
 
 ## Типичные задачи и где их трогать
 
-- **Новая env-настройка:** добавь чтение в начале `app.py`, дефолт, и (если влияет на
-  отдачу) поле в `build_summary`/`/api/admin/settings`; задокументируй в README-таблице.
-- **Новый рантайм-тогл админки:** ключ в `settings`, дефолт-функция (по аналогии с
-  `skip_global_default`), отдача в GET `/api/admin/settings`, приём в POST, второй
-  `.adminrow` в HTML, токены в `_UNIQ_TOKENS`, JS через `postSetting(...)`.
-- **Новая тема:** блок `html[data-theme="..."]{ --bg:…; … }` в CSS + ветка в JS-цикле
-  темы (`NEXT`/`ICON`/`NAMES`).
-- **Меняешь расчёт аптайма/простоя:** это `build_summary` (агрегат по дням, группировка)
-  и `poll_once` (как пишется `daily`/`down_conf`). Проверяй на сидированной SQLite —
-  заведи `current`/`daily`/`samples` руками и дёрни `/api/summary`.
+- **Новая env-настройка**: чтение в начале `app.py`, дефолт, документация в
+  README-таблице, использование в нужной функции.
+- **Новый рантайм-тогл админки**: ключ в `settings`, дефолт-функция (по
+  аналогии с `skip_global_default`), отдача в GET `/api/admin/settings`,
+  приём в POST, второй `.adminrow` в HTML, токены в `_UNIQ_TOKENS`,
+  JS через `postSetting(...)`.
+- **Новая тема**: блок `html[data-theme="..."]{ --bg:…; … }` в CSS + ветка
+  в JS-цикле темы (`NEXT`/`ICON`/`NAMES`).
+- **Меняешь расчёт аптайма/простоя**: это `build_summary`. Проверяй на
+  сидированной SQLite — заведи `current`/`probe_daily`/`probe_samples`
+  руками и дёрни `/api/summary`.
+- **Меняешь probe-агента**: проверь, что он умеет читать env с дефолтами;
+  поправь `install-macos.sh` если меняется список env'ов в plist.
+- **Меняешь UI**: проверь рендер при `noData=true` (нет пробников),
+  при `fresh=false` (пробник молчит), при нескольких пробниках, при дубле
+  имени (мердж).
 
-## Как проверять локально без чекера
+## Как тестировать локально без чекера
 
 ```bash
-# Поднять с фейковым CHECKER_URL и заранее засеянной БД:
 DB_PATH=/tmp/x/status.db PORT=18080 ADMIN_TOKEN=t \
   CHECKER_URL=http://127.0.0.1:1 POLL_INTERVAL=3600 python3 app.py
-# Затем curl http://127.0.0.1:18080/api/summary и т.п.
 ```
 
-Для проверки опроса — поднять мок-HTTP, отдающий `{"data":[{"stableId":...,"online":...}]}`
-на `/api/v1/public/proxies`, и указать на него `CHECKER_URL` с маленьким `POLL_INTERVAL`.
+Затем сидим данные руками через `sqlite3` и дёргаем `/api/summary`.
+Для проверки опроса — поднять мок-HTTP, отдающий
+`{"data":[{"stableId":...,"online":...}]}` на `/api/v1/public/proxies`, и
+указать его как `CHECKER_URL` с маленьким `POLL_INTERVAL`.
+
+Для проверки пробника:
+```bash
+PROBE_TOKEN=$(curl -X POST -H "X-Admin-Token: t" -d '{"name":"test"}' \
+  http://127.0.0.1:18080/api/admin/probes | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['probe_token'])")
+curl -X POST -H "X-Probe-Token: $PROBE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"geo":"ru","results":[{"name":"Switzerland","ok":true,"rtt":42}]}' \
+  http://127.0.0.1:18080/api/probe/report
+```
