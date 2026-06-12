@@ -403,12 +403,47 @@ monitorvpn stop        # остановить
 monitorvpn restart     # перезапуск
 monitorvpn status      # статус + последние строки лога
 monitorvpn logs        # tail -f лога
+monitorvpn refresh     # force-refresh подписки на сервере
 monitorvpn delete      # полностью удалить
 ```
 
 `monitorvpn` — bash-скрипт в `~/.xrs-probe/monitorvpn`, при установке через
 `install-macos.sh` создаётся symlink в `/usr/local/bin/monitorvpn`. Если нет
 прав на `/usr/local/bin/` — установщик подскажет точную `sudo ln -s` команду.
+
+### На Windows (пробник)
+
+```powershell
+# Установка (нужен Python 3.10+, ставится через `winget install Python.Python.3.12`)
+mkdir ~\xrs-probe; cd ~\xrs-probe
+curl.exe -fsSL https://raw.githubusercontent.com/Mrvibecodic/xray-checker-statuspage/main/probes/install-windows.ps1 -o install-windows.ps1
+.\install-windows.ps1
+
+# Управление (после установки команда `monitorvpn` появится в PATH; перезайди
+# в PowerShell, чтобы её увидеть).
+monitorvpn start | stop | restart | status | logs | refresh | delete
+```
+
+Сделано через **Scheduled Task `XrayCheckerProbe`** с триггером «At log on» и
+авто-перезапуском при падении. Конфиг (URL и `PROBE_TOKEN`) — в
+`%USERPROFILE%\.xrs-probe\config.env`. Wrapper-скрипт `run-agent.ps1` читает
+config, выставляет env-переменные и зовёт `python agent.py *>> agent.log`.
+CMD-обёртка `%USERPROFILE%\.local\bin\monitorvpn.cmd` зовёт PowerShell-CLI
+из `~/.xrs-probe/monitorvpn.ps1`; путь добавляется в User PATH установщиком.
+
+### Обновление подписки
+
+Сервер кеширует список таргетов на `PROBE_TARGETS_TTL_MIN` минут (default 10).
+По истечении кеша при следующем запросе пробника сервер тянет подписку
+заново. То есть если ты обновил подписку — пробники автоматически подхватят
+изменения в течение TTL.
+
+**Принудительное обновление** (если не хочешь ждать):
+- Со стороны пробника: `monitorvpn refresh` (любая платформа). Шлёт
+  `GET /api/probe/targets?force=1` с `X-Probe-Token` — сервер игнорирует
+  кеш и тянет подписку немедленно.
+- Со стороны админа: `GET /api/admin/probe-targets?force=1` с
+  `X-Admin-Token` — то же, но без пробника (для CI или скриптов).
 
 ### В админ-режиме на странице
 

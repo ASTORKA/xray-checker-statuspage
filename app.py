@@ -323,15 +323,18 @@ def _fetch_subscription_text():
     return raw
 
 
-def get_probe_targets():
+def get_probe_targets(force=False):
     """С кешированием на PROBE_TARGETS_TTL_MIN минут возвращает список таргетов.
-    На ошибке тянемки — возвращает прошлый кеш (если был)."""
+    force=True — игнорируем кеш и ходим на подписку немедленно (для force-refresh
+    при обновлении подписки на стороне владельца). При ошибке тянемки возвращаем
+    прошлый кеш (если был), чтобы пробники продолжали работать."""
     if not PROBE_SUBSCRIPTION_URL:
         return []
     now = int(time.time())
     with _targets_lock:
-        if (now - _targets_cache["ts"] < PROBE_TARGETS_TTL_MIN * 60
-                and _targets_cache["data"]):
+        cache_fresh = (now - _targets_cache["ts"] < PROBE_TARGETS_TTL_MIN * 60
+                       and _targets_cache["data"])
+        if not force and cache_fresh:
             return _targets_cache["data"]
         try:
             raw = _fetch_subscription_text()
@@ -372,29 +375,57 @@ def find_probe_by_token(token):
     return row if row else None
 
 
-def create_probe(name, replace=False):
-    """Создаёт нового пробника. Если replace=True — удаляет всех существующих
-    с тем же именем (вместе с их probe_samples/probe_daily). Это нужно
-    чтобы повторный запуск install-macos.sh не плодил дубли."""
+def create_probe(name, mode="merge"):
+    """Регистрирует пробника. Три режима:
+
+    - "merge" (default): если есть пробник с таким именем — переиспользуем
+      его probe_id, обновляем token_hash, возвращаем новый токен. История
+      (probe_samples/probe_daily) сохраняется — это нужно когда пользователь
+      переустанавливает агента после рестарта Mac/Windows и хочет, чтобы
+      30-дневный график не пропал.
+    - "new": всегда создаём новый probe_id. Старые с тем же именем остаются;
+      их данные будут отображаться в той же полосе (мердж по имени в UI).
+    - "replace": сносим всех существующих с тем же именем (вместе с их
+      probe_samples/probe_daily) и создаём свежего. Используется для полного
+      сброса истории пробника.
+    """
     name = (name or "").strip() or "probe"
-    pid = _gen_probe_id()
+    mode = (mode or "merge").lower()
+    if mode not in ("merge", "new", "replace"):
+        mode = "merge"
     tok = _gen_probe_token()
     now = int(time.time())
     removed = 0
+    reused = False
     with _lock, conn() as c:
-        if replace:
-            old = [r[0] for r in c.execute(
-                "SELECT probe_id FROM probes WHERE name=?", (name,)).fetchall()]
-            for opid in old:
+        existing = c.execute(
+            "SELECT probe_id, created_at FROM probes WHERE name=? "
+            "ORDER BY created_at", (name,)).fetchall()
+        if mode == "replace" and existing:
+            for opid, _ in existing:
                 c.execute("DELETE FROM probes WHERE probe_id=?", (opid,))
                 c.execute("DELETE FROM probe_samples WHERE probe_id=?", (opid,))
                 c.execute("DELETE FROM probe_daily WHERE probe_id=?", (opid,))
-            removed = len(old)
-        c.execute("""INSERT INTO probes(probe_id, name, token_hash, created_at)
-                     VALUES(?,?,?,?)""",
-                  (pid, name, _hash_token(tok), now))
+            removed = len(existing)
+            existing = []
+        if mode == "merge" and existing:
+            # Переиспользуем самый ранний probe_id, обновляем токен.
+            pid = existing[0][0]
+            c.execute(
+                "UPDATE probes SET token_hash=?, last_seen=? WHERE probe_id=?",
+                (_hash_token(tok), now, pid))
+            reused = True
+            created_at = existing[0][1] or now
+        else:
+            pid = _gen_probe_id()
+            c.execute(
+                "INSERT INTO probes(probe_id, name, token_hash, created_at) "
+                "VALUES(?,?,?,?)",
+                (pid, name, _hash_token(tok), now))
+            created_at = now
     return {"probe_id": pid, "name": name, "probe_token": tok,
-            "created_at": now, "replaced": removed}
+            "created_at": created_at, "mode": mode,
+            "reused": reused, "replaced": removed}
 
 
 def list_probes():
@@ -2004,8 +2035,10 @@ class Handler(BaseHTTPRequestHandler):
                        "application/json; charset=utf-8")
         elif path == "/api/probe/targets":
             # Список таргетов для пробника. Аутентификация — X-Probe-Token.
-            # Сервер сам тянет подписку (см. PROBE_SUBSCRIPTION_URL), парсит
-            # vless-конфиги, отдаёт {host, port, sni, name}. Кеш TTL — 10 мин.
+            # Сервер тянет подписку (PROBE_SUBSCRIPTION_URL) с кешем
+            # PROBE_TARGETS_TTL_MIN минут. Параметр ?force=1 — игнорировать
+            # кеш и обновить сейчас (нужно когда владелец только что поменял
+            # подписку и хочет, чтобы пробники подхватили без задержки).
             token = self.headers.get("X-Probe-Token", "") or ""
             p = find_probe_by_token(token)
             if not p:
@@ -2017,10 +2050,36 @@ class Handler(BaseHTTPRequestHandler):
                     '{"error":"PROBE_SUBSCRIPTION_URL не задан на сервере"}',
                     "application/json; charset=utf-8")
                 return
-            targets = get_probe_targets()
+            qs = parse_qs(parsed.query)
+            force = (qs.get("force") or [""])[0] in ("1", "true", "yes")
+            targets = get_probe_targets(force=force)
             self._send(200,
                        json.dumps({"targets": targets,
-                                   "fetchedAt": _targets_cache["ts"]},
+                                   "fetchedAt": _targets_cache["ts"],
+                                   "ttlMinutes": PROBE_TARGETS_TTL_MIN,
+                                   "forced": force},
+                                  ensure_ascii=False),
+                       "application/json; charset=utf-8")
+        elif path == "/api/admin/probe-targets":
+            # Админский force-refresh: вернуть свежий список + статус кеша.
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            if not PROBE_SUBSCRIPTION_URL:
+                self._send(503,
+                    '{"error":"PROBE_SUBSCRIPTION_URL не задан"}',
+                    "application/json; charset=utf-8")
+                return
+            qs = parse_qs(parsed.query)
+            force = (qs.get("force") or [""])[0] in ("1", "true", "yes")
+            targets = get_probe_targets(force=force)
+            self._send(200,
+                       json.dumps({"count": len(targets),
+                                   "targets": targets,
+                                   "fetchedAt": _targets_cache["ts"],
+                                   "ttlMinutes": PROBE_TARGETS_TTL_MIN,
+                                   "forced": force},
                                   ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif path == "/health":
@@ -2096,10 +2155,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, '{"error":"unauthorized"}',
                            "application/json; charset=utf-8")
                 return
-            body = self._read_json()
-            name = (body.get("name") if isinstance(body, dict) else "") or ""
-            replace = bool(body.get("replace")) if isinstance(body, dict) else False
-            probe = create_probe(name, replace=replace)
+            body = self._read_json() or {}
+            name = body.get("name") or ""
+            # mode: "merge" (default, переиспользует pid), "new", "replace".
+            # Совместимость: старый параметр replace=true → mode="replace".
+            mode = (body.get("mode") or "").lower()
+            if not mode:
+                mode = "replace" if body.get("replace") else "merge"
+            probe = create_probe(name, mode=mode)
             self._send(200,
                        json.dumps({"ok": True, **probe}, ensure_ascii=False),
                        "application/json; charset=utf-8")
