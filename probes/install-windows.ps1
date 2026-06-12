@@ -209,10 +209,11 @@ Write-G "→ регистрируем Scheduled Task '$TaskName' (триггер
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $psExe = (Get-Command powershell.exe).Source
-$action = New-ScheduledTaskAction -Execute $psExe -Argument @(
-    '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-    '-File', "`"$AppDir\run-agent.ps1`""
-)
+# -Argument ждёт ОДНУ строку со всеми аргументами (не массив — иначе
+# ParameterArgumentTransformationError). Путь к скрипту в кавычках на случай
+# пробелов в имени пользователя.
+$taskArgs = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + "$AppDir\run-agent.ps1" + '"'
+$action = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -247,7 +248,7 @@ if ($userPath -notlike "*$LocalBin*") {
 
 Write-Host ''
 Write-G '✓ агент запущен. При следующих логинах будет стартовать сам.'
-Write-Host "   Управление:  monitorvpn {start|stop|restart|status|logs|refresh|delete}"
+Write-Host "   Управление:  monitorvpn {start|stop|restart|status|logs|refresh|update|xray-update|delete}"
 Write-Host "   Логи:        $LogFile"
 Write-Host "   Снести:      monitorvpn delete   (или: .\install-windows.ps1 -Uninstall)"
 Write-Host ''
