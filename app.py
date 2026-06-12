@@ -646,6 +646,30 @@ def delete_server(sid):
             c.execute("DELETE FROM current WHERE sid=?", (s,))
             c.execute("DELETE FROM daily   WHERE sid=?", (s,))
             c.execute("DELETE FROM samples WHERE sid=?", (s,))
+            c.execute("DELETE FROM probe_samples WHERE sid=?", (s,))
+            c.execute("DELETE FROM probe_daily   WHERE sid=?", (s,))
+        return len(members)
+
+
+def wipe_server_history(sid):
+    """Стирает историю опросов ОДНОГО сервера (по группе с тем же `name`),
+    оставляя сам сервер в списке. Чистит probe_samples/probe_daily (+ legacy
+    daily/samples) по всем sid'ам группы. probe_vpn_samples НЕ трогаем — VPN-
+    периоды привязаны к устройству, а не к серверу. Сервер остаётся в `current`,
+    графики/аптайм по нему начнут копиться заново."""
+    if not sid:
+        return 0
+    with _lock, conn() as c:
+        row = c.execute("SELECT name FROM current WHERE sid=?", (sid,)).fetchone()
+        if not row:
+            return 0
+        members = [r[0] for r in c.execute(
+            "SELECT sid FROM current WHERE name=?", (row[0],)).fetchall()]
+        if not members:
+            return 0
+        ph = ",".join("?" * len(members))
+        for tbl in ("probe_samples", "probe_daily", "daily", "samples"):
+            c.execute("DELETE FROM %s WHERE sid IN (%s)" % (tbl, ph), tuple(members))
         return len(members)
 
 
@@ -1216,10 +1240,12 @@ body{margin:0;background:var(--bg);color:var(--tx);
 #tip .d{font-weight:600;margin-bottom:4px;}
 #tip .k{color:var(--tx2);line-height:1.5;}
 .skel{color:var(--tx2);font-size:14px;padding:30px 0;text-align:center;}
-.delbtn{display:flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
+.delbtn,.wipebtn{display:flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
   border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--tx3);cursor:pointer;
   margin-left:2px;transition:background .15s,color .15s,border-color .15s;}
 .delbtn:hover{background:rgba(232,80,80,.12);color:var(--bad);border-color:var(--bad);}
+/* Очистка истории сервера — нейтральный (синий) hover, не путать с красным × */
+.wipebtn:hover{background:rgba(47,107,255,.12);color:#3d7bf0;border-color:#3d7bf0;}
 #lock.lockon{background:rgba(47,107,255,.13);color:var(--info);border-color:var(--info);}
 .adminbar{display:flex;flex-direction:column;
   background:var(--card);border:1px solid var(--line);border-radius:14px;
@@ -1279,6 +1305,7 @@ body{margin:0;background:var(--bg);color:var(--tx);
   .label{width:auto;flex:1 1 auto;min-width:0;}
   .stat2{width:auto;text-align:right;}
   .chev{order:4;}
+  .wipebtn{order:2;}
   .delbtn{order:3;}
   .bars{order:5;flex-basis:100%;height:26px;}
   .legend{gap:9px 14px;margin-top:14px;} .legend .right{display:none;}
@@ -1736,6 +1763,12 @@ function buildList(data){
     chev.innerHTML='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
     row.appendChild(label);row.appendChild(st2);row.appendChild(chev);
     if(adminMode){
+      // Очистить историю опросов этого сервера (сервер остаётся в списке).
+      var wipe=document.createElement("button");wipe.type="button";wipe.className="wipebtn";
+      wipe.title="Очистить историю этого сервера";wipe.setAttribute("aria-label","Очистить историю сервера");
+      wipe.innerHTML='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>';
+      wipe.addEventListener("click",function(e){e.stopPropagation();wipeServerHistory(s.sid,s.name,s.members);});
+      row.appendChild(wipe);
       var del=document.createElement("button");del.type="button";del.className="delbtn";
       del.title="Удалить сервер";del.setAttribute("aria-label","Удалить сервер");
       del.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
@@ -1919,6 +1952,19 @@ function deleteServer(sid,name,members){
     })
     .catch(function(){window.alert("Сетевая ошибка");});
 }
+function wipeServerHistory(sid,name,members){
+  if(!adminMode)return;
+  if(!window.confirm('Очистить историю опросов сервера «'+name+'»?\n\nГрафики и 30-дневный аптайм по этому серверу обнулятся, но сам сервер останется в списке — данные начнут копиться заново. Другие серверы не затрагиваются.\n\nЭто действие необратимо.'))return;
+  fetch("api/admin/wipe-server",{method:"POST",
+    headers:{"X-Admin-Token":adminToken,"Content-Type":"application/json"},
+    body:JSON.stringify({sid:sid})})
+    .then(function(r){
+      if(r.ok){built=false;load();}
+      else if(r.status===401){window.alert("Сессия истекла. Войдите заново.");logoutAdmin();}
+      else{window.alert("Не удалось очистить историю сервера");}
+    })
+    .catch(function(){window.alert("Сетевая ошибка");});
+}
 (function(){
   var b=document.getElementById("lock");if(!b)return;
   b.addEventListener("click",function(){adminMode?logoutAdmin():promptAdminToken();});
@@ -1957,7 +2003,7 @@ document.addEventListener("visibilitychange",function(){if(!document.hidden)load
 _UNIQ_TOKENS = ["tchartwrap", "tcaption", "tchart", "tcanvas", "tscroll",
                 "tyaxis", "tstats", "taxis", "phead", "sdot",
                 "overall", "pgrad",
-                "delbtn", "lockon", "lock",
+                "delbtn", "wipebtn", "lockon", "lock",
                 "adminbar", "adminrow", "adminlabel", "actoggle", "actogon", "aclocked",
                 "bands", "band", "bandName", "bandPName", "bandDot",
                 "bandDotOk", "bandDotBad", "bandDotVpn", "bandDotStale", "bandBars",
@@ -2296,6 +2342,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             wipe_history()
             self._send(200, '{"ok":true}', "application/json; charset=utf-8")
+        elif path == "/api/admin/wipe-server":
+            # Очистка истории опросов ОДНОГО сервера по {sid}. Сам сервер
+            # остаётся в списке, чистится только его probe-история.
+            if not self._is_admin():
+                self._send(401, '{"error":"unauthorized"}',
+                           "application/json; charset=utf-8")
+                return
+            body = self._read_json()
+            sid = (body.get("sid") if isinstance(body, dict) else None) or ""
+            if not sid:
+                self._send(400, '{"error":"sid required"}',
+                           "application/json; charset=utf-8")
+                return
+            n = wipe_server_history(sid)
+            self._send(200,
+                       json.dumps({"ok": True, "cleared": n}, ensure_ascii=False),
+                       "application/json; charset=utf-8")
         elif path == "/api/admin/settings":
             if not self._is_admin():
                 self._send(401, '{"error":"unauthorized"}',
