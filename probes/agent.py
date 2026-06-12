@@ -65,13 +65,23 @@ XRAY_BIN_ENV = os.environ.get("XRAY_BIN", "").strip()
 PROBE_TEST_URL = os.environ.get("PROBE_TEST_URL",
                                 "http://cp.cloudflare.com/cdn-cgi/trace")
 PROBE_TEST_MARKER = os.environ.get("PROBE_TEST_MARKER", "fl=")
-# Этап 2: после короткого fl=-теста качаем чуть больше PROBE_BULK_MIN_BYTES
-# через тот же прокси. У ряда российских провайдеров DPI пропускает
-# первые ~16KB через cloudflare-сервера, а потом рвёт соединение — короткий
-# trace через chrome-fp проходит, реальный трафик нет. Big-download ловит это.
-PROBE_BULK_URL = os.environ.get(
-    "PROBE_BULK_URL", "http://speed.cloudflare.com/__down?bytes=65536")
+# Этап 2: после короткого fl=-теста подгружаем главную YouTube через тот же
+# прокси. YouTube — главная цель блокировок РФ, плюс ~1MB реальной HTML/JS-
+# страницы (cloudflare-trace на 700 байт DPI просто пропускает, а полтонны
+# килобайт реального трафика — нет). Проверка считается успешной если:
+#   - получили ≥ PROBE_BULK_MIN_BYTES байт,
+#   - в первых байтах виден PROBE_BULK_MARKER (защита от случайного
+#     наполнения мусором при DPI-rewrite или fallback).
+PROBE_BULK_URL = os.environ.get("PROBE_BULK_URL", "https://www.youtube.com/")
 PROBE_BULK_MIN_BYTES = int(os.environ.get("PROBE_BULK_MIN_BYTES", "65000"))
+PROBE_BULK_MARKER = os.environ.get("PROBE_BULK_MARKER", "youtube").lower()
+# YouTube отдаёт разный контент в зависимости от UA; со старым/curl-like UA
+# может ответить «обновите браузер» (мало данных, без скриптов). Шлём
+# актуальный Chrome — чтобы получить нормальную страницу.
+PROBE_BULK_USER_AGENT = os.environ.get(
+    "PROBE_BULK_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 USER_AGENT = "xrs-probe/0.2"
 
 
@@ -405,25 +415,37 @@ def xray_probe(xray_bin, t, direct_ip=""):
             if direct_ip and tunnel_ip and tunnel_ip == direct_ip:
                 return False, 0, ("туннель не использовался: ip совпадает "
                                   "с прямым (%s)" % tunnel_ip)
-            # Проверка 2: скачиваем PROBE_BULK_MIN_BYTES+ байт через тот же
-            # прокси. Многие DPI пропускают первые ~16KB к cloudflare и
-            # рвут поток позже. Если читаем меньше — туннель «вроде живой,
-            # но реально нерабочий».
+            # Проверка 2: подгружаем PROBE_BULK_URL (по умолчанию youtube.com)
+            # через тот же прокси. Это и реалистичный объём (~1MB), и сам
+            # YouTube — главная цель российских блокировок. Если страница
+            # реально получена (есть маркер + не меньше PROBE_BULK_MIN_BYTES) —
+            # туннель работает по-настоящему. Если оборвалось — DPI режет.
             try:
                 req2 = urllib.request.Request(
-                    PROBE_BULK_URL, headers={"User-Agent": USER_AGENT})
-                with opener.open(req2, timeout=min(TIMEOUT, 10.0)) as r2:
+                    PROBE_BULK_URL,
+                    headers={"User-Agent": PROBE_BULK_USER_AGENT,
+                             "Accept": "text/html,application/xhtml+xml",
+                             "Accept-Language": "en-US,en;q=0.5"})
+                with opener.open(req2, timeout=min(TIMEOUT, 12.0)) as r2:
                     received = 0
+                    head_sample = b""
                     while True:
                         chunk = r2.read(16384)
                         if not chunk:
                             break
                         received += len(chunk)
+                        if len(head_sample) < 65536:
+                            head_sample += chunk[:65536 - len(head_sample)]
                         if received >= PROBE_BULK_MIN_BYTES * 2:
-                            break  # достаточно
+                            break
                 if received < PROBE_BULK_MIN_BYTES:
-                    return False, 0, ("обрыв туннеля (DPI?): получено "
-                                      "%d/%d байт" % (received, PROBE_BULK_MIN_BYTES))
+                    return False, 0, ("обрыв туннеля: получено %d/%d байт"
+                                      % (received, PROBE_BULK_MIN_BYTES))
+                if (PROBE_BULK_MARKER and
+                        PROBE_BULK_MARKER not in
+                        head_sample.decode("utf-8", "ignore").lower()):
+                    return False, 0, ("страница пришла, но без маркера '%s' "
+                                      "(подмена контента?)" % PROBE_BULK_MARKER)
             except urllib.error.URLError as e:
                 return False, 0, "обрыв при bulk: " + str(e.reason)[:120]
             except (socket.timeout, OSError) as e:
