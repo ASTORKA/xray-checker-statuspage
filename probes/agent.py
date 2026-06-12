@@ -65,6 +65,13 @@ XRAY_BIN_ENV = os.environ.get("XRAY_BIN", "").strip()
 PROBE_TEST_URL = os.environ.get("PROBE_TEST_URL",
                                 "http://cp.cloudflare.com/cdn-cgi/trace")
 PROBE_TEST_MARKER = os.environ.get("PROBE_TEST_MARKER", "fl=")
+# Этап 2: после короткого fl=-теста качаем чуть больше PROBE_BULK_MIN_BYTES
+# через тот же прокси. У ряда российских провайдеров DPI пропускает
+# первые ~16KB через cloudflare-сервера, а потом рвёт соединение — короткий
+# trace через chrome-fp проходит, реальный трафик нет. Big-download ловит это.
+PROBE_BULK_URL = os.environ.get(
+    "PROBE_BULK_URL", "http://speed.cloudflare.com/__down?bytes=65536")
+PROBE_BULK_MIN_BYTES = int(os.environ.get("PROBE_BULK_MIN_BYTES", "65000"))
 USER_AGENT = "xrs-probe/0.2"
 
 
@@ -392,13 +399,35 @@ def xray_probe(xray_bin, t, direct_ip=""):
             rtt = int((time.monotonic() - t0) * 1000)
             if PROBE_TEST_MARKER not in body:
                 return False, 0, "ответ есть, но без маркера '%s'" % PROBE_TEST_MARKER
-            # Проверяем что трафик реально шёл через туннель — IP должен
-            # отличаться от прямого. Если совпадает, значит xray молча упал
-            # в direct (или DPI пропустил голый запрос, а сервер недоступен).
+            # Проверка 1: ip из ответа должен отличаться от прямого. Если
+            # совпадает — xray молча упал в direct (или DPI пропустил голый).
             tunnel_ip = _parse_trace_ip(body)
             if direct_ip and tunnel_ip and tunnel_ip == direct_ip:
                 return False, 0, ("туннель не использовался: ip совпадает "
                                   "с прямым (%s)" % tunnel_ip)
+            # Проверка 2: скачиваем PROBE_BULK_MIN_BYTES+ байт через тот же
+            # прокси. Многие DPI пропускают первые ~16KB к cloudflare и
+            # рвут поток позже. Если читаем меньше — туннель «вроде живой,
+            # но реально нерабочий».
+            try:
+                req2 = urllib.request.Request(
+                    PROBE_BULK_URL, headers={"User-Agent": USER_AGENT})
+                with opener.open(req2, timeout=min(TIMEOUT, 10.0)) as r2:
+                    received = 0
+                    while True:
+                        chunk = r2.read(16384)
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                        if received >= PROBE_BULK_MIN_BYTES * 2:
+                            break  # достаточно
+                if received < PROBE_BULK_MIN_BYTES:
+                    return False, 0, ("обрыв туннеля (DPI?): получено "
+                                      "%d/%d байт" % (received, PROBE_BULK_MIN_BYTES))
+            except urllib.error.URLError as e:
+                return False, 0, "обрыв при bulk: " + str(e.reason)[:120]
+            except (socket.timeout, OSError) as e:
+                return False, 0, "обрыв при bulk: " + type(e).__name__
             return True, rtt, ""
         except urllib.error.URLError as e:
             # Туннель не открылся — внутри xray может быть лог почему.
