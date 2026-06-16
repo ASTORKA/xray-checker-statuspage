@@ -1444,8 +1444,19 @@ function renderToday(panel,data){
     var w=Math.max(1.5,x2-x1);
     vpnBands+='<rect x="'+x1.toFixed(1)+'" y="0" width="'+w.toFixed(1)+'" height="'+H+'" fill="rgba(150,154,166,.42)"/>';
   });
-  var bands="",runStart=null,runEnd=null,ptsRaw=[];
-  function flush(){if(runStart!==null){bands+='<rect x="'+runStart.toFixed(1)+'" y="0" width="'+Math.max(1.5,runEnd-runStart).toFixed(1)+'" height="'+H+'" fill="rgba(232,80,80,.18)"/>';runStart=null;}}
+  // bands — полупрозрачная заливка периода сбоя на всю высоту; rug — сплошная
+  // красная «дорожка» по низу. Дорожка нужна, чтобы РАЗРОЗНЕННЫЕ сбои (пинг
+  // скачет → периодические таймауты) были видны: одиночные полупрозрачные
+  // полоски на фоне плотной линии сливаются, а сплошная дорожка снизу — нет.
+  var bands="",rug="",runStart=null,runEnd=null,ptsRaw=[];
+  function flush(){
+    if(runStart!==null){
+      var w=Math.max(1.5,runEnd-runStart);
+      bands+='<rect x="'+runStart.toFixed(1)+'" y="0" width="'+w.toFixed(1)+'" height="'+H+'" fill="rgba(232,80,80,.22)"/>';
+      rug+='<rect x="'+runStart.toFixed(1)+'" y="'+(H-7)+'" width="'+w.toFixed(1)+'" height="7" fill="rgba(232,80,80,.92)"/>';
+      runStart=null;
+    }
+  }
   data.samples.forEach(function(s){
     var x=(s.ts-ds)/span*W;
     if(s.online){flush();if(s.latency>0)ptsRaw.push([x,s.latency]);}
@@ -1470,7 +1481,7 @@ function renderToday(panel,data){
   if(data.isToday){var nowX=((data.now-ds)/span*W);nowLine='<line x1="'+nowX.toFixed(1)+'" y1="0" x2="'+nowX.toFixed(1)+'" y2="'+base+'" stroke="var(--tx3)" stroke-width="1" stroke-dasharray="4 4"/>';}
   var svg='<svg viewBox="0 0 1000 '+H+'" preserveAspectRatio="none" class="tchart">'+
     '<defs><linearGradient id="pgrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2f6bff" stop-opacity="0.20"/><stop offset="1" stop-color="#2f6bff" stop-opacity="0"/></linearGradient></defs>'+
-    grid+area+bands+vpnBands+line+nowLine+
+    grid+area+line+bands+rug+vpnBands+nowLine+
     '<line class="cursor" x1="0" y1="0" x2="0" y2="'+base+'" stroke="var(--tx2)" stroke-width="1" opacity="0"/>'+
     '</svg>';
   var zoom=2;
