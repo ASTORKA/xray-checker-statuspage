@@ -1484,7 +1484,12 @@ function renderToday(panel,data){
     grid+area+line+bands+rug+vpnBands+nowLine+
     '<line class="cursor" x1="0" y1="0" x2="0" y2="'+base+'" stroke="var(--tx2)" stroke-width="1" opacity="0"/>'+
     '</svg>';
-  var zoom=2;
+  // zoom=1 — весь день (00:00–24:00) влезает в видимую область без прокрутки.
+  // Раньше было 2 (12-часовое окно с авто-скроллом к «сейчас»), но так
+  // утренние сбои уезжали за левый край и казались отсутствующими, хотя в
+  // счётчике «Ошибок опроса» учитывались. Статус-странице важнее показать
+  // весь день целиком, чем 2× детализацию недавних часов.
+  var zoom=1;
   var axis="";for(var h2=0;h2<=24;h2+=3){axis+='<span>'+("0"+h2).slice(-2)+':00</span>';}
   var st=data.stats,last=data.samples[data.samples.length-1];
   var stats='<div class="tstats">'+
