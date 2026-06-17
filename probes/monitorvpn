@@ -118,11 +118,15 @@ case "${cmd}" in
     echo "${RESP}" | /usr/bin/python3 -c '
 import sys, json, datetime as dt
 d = json.load(sys.stdin)
-n = len(d.get("targets", []))
+tg = d.get("targets", [])
 ts = d.get("fetchedAt", 0)
 when = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
-print(f"✓ сервер вернул {n} таргетов (fetchedAt={when})")
-print("  пробник подхватит обновлённый список со следующим циклом (через INTERVAL сек).")
+print("✓ сервер вернул " + str(len(tg)) + " хостов (подписка прочитана " + when + "):")
+for t in tg:
+    print("   • " + str(t.get("name")) + "  [" + str(t.get("host")) + ":" + str(t.get("port")) + "]")
+print("  пробник подхватит этот список со следующим циклом (через INTERVAL сек).")
+print("  Нет нужного хоста? значит его нет в подписке ИЛИ строка не распарсилась")
+print("    (нужен валидный vless:// с uuid). Проверь подписку у источника.")
 '
     ;;
   update|self-update)

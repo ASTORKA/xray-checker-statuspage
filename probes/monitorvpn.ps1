@@ -128,8 +128,13 @@ switch ($canon) {
                 -Headers @{ 'X-Probe-Token' = $cfg.PROBE_TOKEN } -TimeoutSec 20
             $n = ($resp.targets | Measure-Object).Count
             $when = ([DateTimeOffset]::FromUnixTimeSeconds([int64]$resp.fetchedAt)).LocalDateTime
-            Write-G "✓ сервер вернул $n таргетов (fetchedAt=$when)"
-            Write-Host '  пробник подхватит обновлённый список со следующим циклом.'
+            Write-G "✓ сервер вернул $n хостов (подписка прочитана $when):"
+            foreach ($t in $resp.targets) {
+                Write-Host ("   - {0}  [{1}:{2}]" -f $t.name, $t.host, $t.port)
+            }
+            Write-Host '  пробник подхватит этот список со следующим циклом.'
+            Write-Host '  Нет нужного хоста? значит его нет в подписке ИЛИ строка не'
+            Write-Host '    распарсилась (нужен валидный vless:// с uuid).'
         } catch {
             Write-R "не удалось: $($_.Exception.Message)"
             exit 1
