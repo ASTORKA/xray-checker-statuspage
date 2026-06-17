@@ -455,7 +455,7 @@ bash install-linux.sh
 - [kutovoys/xray-checker](https://github.com/kutovoys/xray-checker) — с него начинался проект.
 - [XTLS/Xray-core](https://github.com/XTLS/Xray-core) — движок, которым пробники реально
   проверяют туннели.
-
+09adf33c6d1654d1167bce5fafcaa301d6e8595f99331b2f
 ## Лицензия
 
 MIT
